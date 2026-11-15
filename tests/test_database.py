@@ -36,3 +36,18 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(channel.endpoint, (await self.db.authenticate(self.tenant, "public", other)).peers)
         public = await self.db.list_channels(self.tenant)
         self.assertNotIn("credentials", public[0])
+
+    async def test_instagram_account_lookup(self):
+        token = uuid4().hex + uuid4().hex
+        await self.db.add_client(self.tenant, "admin", token, [])
+        account = str(uuid4().int)[:30]
+        cid = uuid4().hex
+        creds = {"token": "example-provider-secret", "webhook_secret": "example-hook",
+                 "account_id": account}
+        await self.db.add_channel(cid, self.tenant, "admin", "instagram", creds, "example-hook")
+        channel = await self.db.instagram_channel(account)
+        self.assertIsNotNone(channel)
+        self.assertEqual(channel.id, cid)
+        self.assertEqual(channel.credentials, creds)
+        await self.db.query("UPDATE channels SET enabled=0 WHERE id=%s", (cid,), write=True)
+        self.assertIsNone(await self.db.instagram_channel(account))

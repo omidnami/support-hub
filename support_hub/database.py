@@ -111,7 +111,7 @@ class Database:
         await self.query(
             "INSERT INTO channels (id,tenant,endpoint,owner_endpoint,platform,credentials,webhook_hash,provider_account_id)"
             " VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-            (channel_id, tenant, "ch-" + channel_id, owner, platform, encrypted, digest(hook)),
+            (channel_id, tenant, "ch-" + channel_id, owner, platform, encrypted, digest(hook), provider_account),
             write=True)
 
     def channel(self, row):

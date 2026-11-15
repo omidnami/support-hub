@@ -30,7 +30,8 @@ def build_app(db, manager):
         try:
             response = await handler(request)
         except web.HTTPException as exc:
-            response = exc
+            exc.headers["Cache-Control"] = "no-store"
+            raise
         except Exception:
             log.warning("HTTP request failed")
             response = web.json_response({"error": "temporarily_unavailable"}, status=503)
