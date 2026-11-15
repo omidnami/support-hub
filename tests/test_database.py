@@ -1,9 +1,11 @@
 """Integration tests: dedicated disposable MariaDB database only."""
+import asyncio
 import os
 import unittest
 from uuid import uuid4
 
 from support_hub.database import Database
+from support_hub.migrations import discover
 
 
 @unittest.skipUnless(os.getenv("HUB_TEST_DB") == "1", "Set HUB_TEST_DB=1 for database integration tests")
@@ -17,6 +19,22 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.db.query("DELETE FROM channels WHERE tenant=%s", (self.tenant,), write=True)
         await self.db.query("DELETE FROM clients WHERE tenant=%s", (self.tenant,), write=True)
         await self.db.close()
+
+    async def test_migrations_are_idempotent_and_indexed(self):
+        migrations = await self.db.migration_status()
+        self.assertEqual([name for name, _ in migrations], [m.name for m in discover()])
+        self.assertTrue(all(applied for _, applied in migrations))
+        before = await self.db.query("SELECT * FROM migrations ORDER BY name")
+        results = await asyncio.gather(self.db.migrate(), self.db.migrate())
+        self.assertEqual(results, [[], []])
+        self.assertEqual(before, await self.db.query("SELECT * FROM migrations ORDER BY name"))
+        indexes = await self.db.query("SHOW INDEX FROM channels")
+        self.assertTrue(any(row["Key_name"] == "unique_provider_account" and row["Non_unique"] == 0 for row in indexes))
+        fk = await self.db.query(
+            "SELECT REFERENCED_TABLE_NAME FROM information_schema.KEY_COLUMN_USAGE "
+            "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='channels' "
+            "AND REFERENCED_TABLE_NAME='clients'")
+        self.assertEqual(len(fk), 2)
 
     async def test_auth_and_encrypted_channel(self):
         token = uuid4().hex + uuid4().hex

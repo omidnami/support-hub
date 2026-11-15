@@ -77,8 +77,8 @@ Keep this key private and backed up separately from the database. Never commit .
 Database mode overrides static endpoints.
 
     source .env
-    # For local development only: python -m support_hub.admin init-db
-    # On cPanel import schema.sql via phpMyAdmin instead.
+    python -m support_hub.admin migrate
+    python -m support_hub.admin migrate-status
     python -m support_hub.admin add-client shop1 admin --peer public
     python -m support_hub.admin add-client shop1 public --peer admin
     python -m support_hub.admin add-channel shop1 admin telegram
@@ -124,7 +124,7 @@ not unregister an upstream webhook. Disabled clients cannot send further frames;
 
 ## Central management API
 
-Apply schema.sql to the selected database via phpMyAdmin on cPanel; init-db is a local CLI alternative.
+Apply pending database migrations with python -m support_hub.admin migrate before restarting an updated service.
 Set HUB_MANAGEMENT_KEY to a unique random secret (32+ characters); routes are
 disabled if absent. Only the trusted central backend may possess this key.
 It grants access across tenants; never ship it to stores or browsers.
@@ -256,5 +256,61 @@ HUB_REDIS_PREFIX is validated and used by messages, indexes, dedup receipts and
 browser sessions. Changing the prefix or Redis DB does not migrate existing data;
 keep them stable after rollout. The app never uses flush or global Redis commands.
 CI exercises scoped Redis ACL permissions on Redis 6.2 and 7.
-The database/user are provisioned in cPanel, and schema.sql is imported through
-phpMyAdmin into the selected database. Runtime does not create tables or users.
+The database/user are provisioned in cPanel; use the CLI migration command to create
+and update tables. No manual phpMyAdmin import is needed. Runtime does not create tables or users.
+
+## Database migrations (required for install and upgrades)
+
+Create the empty MariaDB database and its dedicated user in cPanel, assign the
+user to that database, and configure HUB_DB_* and HUB_ENCRYPTION_KEY in .env.
+The user needs CREATE, ALTER, INDEX, REFERENCES, SELECT, INSERT and UPDATE on
+this database for the current migrations (cPanel ALL PRIVILEGES on the dedicated
+database also works). Future migrations may require other database-level grants.
+No root MariaDB credentials or global privileges are needed.
+
+    cd /home/planet/support-hub
+    source .env
+    .venv/bin/python -m support_hub.admin migrate-status
+    .venv/bin/python -m support_hub.admin migrate
+
+Run as the project owner. On upgrades, back up this database, stop the Hub,
+pull the new release, apply migrations, verify status, then restart. Do not
+run migrations implicitly on service startup. The old init-db command is an
+alias for migrate. A legacy database created with the original schema.sql can
+run the initial idempotent migrations without deleting existing tables/data;
+verify the legacy schema matches before adopting it.
+
+### Adding or changing database tables in future releases
+
+The migrations/ directory is the source of truth. The initial migrations are:
+
+    0001_create_clients.sql
+    0002_create_channels.sql
+    0003_create_options.sql
+    0004_add_provider_account_id.sql
+    0005_index_provider_account.sql
+
+Add a new numbered file after the last migration, e.g.
+0006_add_channel_status.sql. Never edit, rename or delete an applied migration.
+Use one SQL statement per file (split multi-step changes into separately
+numbered files). Use MariaDB-compatible SQL and retry-safe DDL, e.g.
+CREATE TABLE IF NOT EXISTS, ALTER TABLE ... ADD COLUMN IF NOT EXISTS, or
+CREATE INDEX IF NOT EXISTS. Include appropriate primary keys, indexes,
+foreign keys and utf8mb4 collation. Review data migrations carefully; no
+destructive changes without backup and explicit approval. Update database
+queries and tests in the same release, and run CI before deploying.
+schema.sql is retained as the original pre-migration schema snapshot for
+reference, not the installation or upgrade path.
+
+The migrations table is automatically created, with filename, SHA-256 checksum
+and applied_at. A database-specific advisory lock prevents simultaneous
+migration runners. Applied files are skipped; missing, edited or out-of-order
+history is rejected. A failed statement is not marked applied. MariaDB DDL
+auto-commits, so there is no automatic transactional rollback or down command:
+inspect failures, repair the issue and rerun retry-safe migrations. Never
+manually delete migration history to force a rerun.
+
+Application tables: clients (tenant + endpoint primary key, unique token hash);
+channels (primary ID, unique tenant/endpoint, owner composite foreign key to
+clients, unique platform/provider account); options (name primary key).
+migrations is infrastructure metadata, not application or customer history.

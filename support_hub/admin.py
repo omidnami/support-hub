@@ -13,9 +13,14 @@ from .channels.instagram import valid_account
 async def run(args):
     db = await Database.open()
     try:
-        if args.command == "init-db":
-            await db.init_schema()
-            print("schema initialized")
+        if args.command in ("init-db", "migrate"):
+            applied = await db.migrate()
+            for name in applied:
+                print("Applied:", name)
+            print(f"{len(applied)} migration(s) applied" if applied else "Nothing to migrate")
+        elif args.command == "migrate-status":
+            for name, applied in await db.migration_status():
+                print("[applied]" if applied else "[pending]", name)
         elif args.command == "add-client":
             token = secrets.token_hex(32)
             await db.add_client(args.tenant, args.endpoint, token, args.peer)
@@ -57,7 +62,9 @@ async def run(args):
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("init-db")
+    sub.add_parser("init-db", help="Compatibility alias for migrate")
+    sub.add_parser("migrate", help="Apply pending database migrations")
+    sub.add_parser("migrate-status", help="List applied and pending migrations")
     c = sub.add_parser("add-client")
     c.add_argument("tenant")
     c.add_argument("endpoint")

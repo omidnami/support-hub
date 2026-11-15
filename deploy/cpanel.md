@@ -47,12 +47,10 @@ If already cloned, use git pull --ff-only from that directory instead.
 
 Use Manage My Databases / Database Wizard to create supporthub and a dedicated
 supporthub user. cPanel may prefix both with planet_. Assign the user to the
-database. For schema installation, use the authorized phpMyAdmin account and
-select only the new database, then import schema.sql. It contains no CREATE
-DATABASE, CREATE USER, DROP or global SQL. At runtime the application uses
-SELECT, INSERT and UPDATE; grant DELETE only if needed for administrative
-cleanup. If you initially use all privileges for import, reduce the app user's
-grants afterwards where practical. Do not run init-db on each service start.
+database. Use ALL PRIVILEGES scoped to this dedicated database for the
+migration/install step; no server-global privileges are required. Configure
+.env first. Migrations create tables, indexes and foreign keys automatically;
+no manual phpMyAdmin import is required. Do not run migrations at each start.
 
 ## 4. Configuration and checks
 
@@ -64,6 +62,8 @@ password and prefix synchronized with the URL and ACL rule.
 
     cd /home/planet/support-hub
     source .env
+    .venv/bin/python -m support_hub.admin migrate
+    .venv/bin/python -m support_hub.admin migrate-status
     .venv/bin/python -m support_hub
 
 From another terminal, check curl --fail http://127.0.0.1:8766/health.

@@ -3,12 +3,12 @@ import hmac
 import json
 import os
 from dataclasses import dataclass
-from pathlib import Path
 
 import aiomysql
 from cryptography.fernet import Fernet
 
 from .config import Endpoint, valid_identifier
+from .migrations import migrate, status
 
 
 def digest(secret):
@@ -51,11 +51,15 @@ class Database:
                 await cur.execute(sql, args)
                 return cur.rowcount if write else await cur.fetchall()
 
+    async def migrate(self):
+        return await migrate(self.pool)
+
+    async def migration_status(self):
+        return await status(self.pool)
+
     async def init_schema(self):
-        schema = Path(__file__).resolve().parent.parent / "schema.sql"
-        for statement in schema.read_text().split(";"):
-            if statement.strip():
-                await self.query(statement, write=True)
+        # Backward-compatible CLI/test entry point.
+        return await self.migrate()
 
     async def client_enabled(self, tenant, endpoint):
         rows = await self.query(
