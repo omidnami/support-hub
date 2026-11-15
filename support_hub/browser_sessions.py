@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 
 from .config import Endpoint, valid_identifier
 from .protocol import encode
+from .redis_keys import DEFAULT_PREFIX, RedisKeys
 
 TOKEN_TTL = 900
 ROUTE_TTL = 18000
@@ -42,12 +43,12 @@ def valid_origin(value):
 
 
 class BrowserSessions:
-    def __init__(self, redis, db):
+    def __init__(self, redis, db, prefix=DEFAULT_PREFIX):
         self.redis, self.db = redis, db
+        self.keys = RedisKeys(prefix)
 
-    @staticmethod
-    def key(tenant, endpoint):
-        return f"support-hub:{{{tenant}}}:browser:{endpoint}"
+    def key(self, tenant, endpoint):
+        return self.keys.browser(tenant, endpoint)
 
     async def issue(self, tenant, owner, session_id, origin):
         if (not valid_identifier(tenant) or not valid_identifier(owner)

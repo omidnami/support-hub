@@ -3,6 +3,7 @@ import hashlib
 import time
 
 from .protocol import encode
+from .redis_keys import DEFAULT_PREFIX, RedisKeys
 
 # Atomic check + store. All three keys share a tenant hash tag.
 ENQUEUE = """
@@ -27,22 +28,11 @@ return removed
 
 
 class RedisManager:
-    def __init__(self, redis, ttl=18000, max_pending=1000):
+    def __init__(self, redis, ttl=18000, max_pending=1000, prefix=DEFAULT_PREFIX):
         self.redis = redis
         self.ttl = ttl
         self.max_pending = max_pending
-
-    @staticmethod
-    def index(tenant, endpoint):
-        return f"support-hub:{{{tenant}}}:pending:{endpoint}"
-
-    @staticmethod
-    def item(tenant, endpoint, delivery_id):
-        return f"support-hub:{{{tenant}}}:message:{endpoint}:{delivery_id}"
-
-    @staticmethod
-    def receipt(tenant, delivery_id):
-        return f"support-hub:{{{tenant}}}:receipt:{delivery_id}"
+        self.keys = RedisKeys(prefix)
 
     async def enqueue(self, tenant, message):
         destination = message["to"]
@@ -52,20 +42,20 @@ class RedisManager:
         now = int(time.time() * 1000)
         expiry = now + self.ttl * 1000
         return await self.redis.eval(
-            ENQUEUE, 3, self.item(tenant, destination, delivery_id),
-            self.index(tenant, destination), self.receipt(tenant, delivery_id),
+            ENQUEUE, 3, self.keys.item(tenant, destination, delivery_id),
+            self.keys.index(tenant, destination), self.keys.receipt(tenant, delivery_id),
             fingerprint, payload, self.ttl, expiry, now, self.max_pending, delivery_id,
         )
 
     async def pending(self, tenant, endpoint):
-        index = self.index(tenant, endpoint)
+        index = self.keys.index(tenant, endpoint)
         await self.redis.zremrangebyscore(index, "-inf", int(time.time() * 1000))
         return await self.redis.zrange(index, 0, self.max_pending - 1)
 
     async def get(self, tenant, endpoint, delivery_id):
-        return await self.redis.get(self.item(tenant, endpoint, delivery_id))
+        return await self.redis.get(self.keys.item(tenant, endpoint, delivery_id))
 
     async def ack(self, tenant, endpoint, delivery_id):
         return bool(await self.redis.eval(
-            ACK, 2, self.item(tenant, endpoint, delivery_id),
-            self.index(tenant, endpoint), delivery_id))
+            ACK, 2, self.keys.item(tenant, endpoint, delivery_id),
+            self.keys.index(tenant, endpoint), delivery_id))

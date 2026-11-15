@@ -112,7 +112,7 @@ def build_app(db, manager):
             raise web.HTTPTooManyRequests(headers={"Retry-After": "1"})
         try:
             body = decode(await request.text())
-            sessions = BrowserSessions(manager.store.redis, db)
+            sessions = BrowserSessions(manager.store.redis, db, prefix=manager.store.keys.prefix)
             result = await sessions.issue(tenant, owner, body.get("session_id"), body.get("origin"))
         except (ValueError, ProtocolError):
             raise web.HTTPBadRequest() from None

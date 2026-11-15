@@ -33,7 +33,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.redis = Redis.from_url(os.environ["HUB_TEST_REDIS_URL"], decode_responses=True)
         self.tenant = "test-" + uuid4().hex
-        self.store = RedisManager(self.redis, ttl=30)
+        self.store = RedisManager(self.redis, ttl=30, prefix='hub-browser-test:')
         self.origin = "https://shop.example.com"
 
         async def verify(tenant, endpoint, token):
@@ -56,7 +56,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         await self.http.close()
         self.server.close()
         await self.server.wait_closed()
-        keys = [k async for k in self.redis.scan_iter(match=f"support-hub:{{{self.tenant}}}:*")]
+        keys = [k async for k in self.redis.scan_iter(match=self.store.keys.tenant(self.tenant) + "*")]
         if keys:
             await self.redis.delete(*keys)
         await self.redis.aclose()
@@ -87,7 +87,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         first, second = await self.issue(sid), await self.issue(sid)
         self.assertEqual(first["endpoint"], second["endpoint"])
         self.assertNotEqual(first["token"], second["token"])
-        sessions = BrowserSessions(self.redis, self.db)
+        sessions = BrowserSessions(self.redis, self.db, prefix=self.store.keys.prefix)
         raw = await self.redis.get(sessions.key(self.tenant, first["endpoint"]))
         self.assertNotIn(second["token"], raw)
         self.assertIsNone(await sessions.authenticate(self.tenant, first["endpoint"], first["token"], self.origin))

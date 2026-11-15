@@ -3,6 +3,8 @@ import os
 import re
 from dataclasses import dataclass
 
+from .redis_keys import DEFAULT_PREFIX, validate_prefix
+
 IDENTIFIER = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 
 
@@ -24,6 +26,7 @@ class Settings:
     ttl: int
     retry: float
     endpoints: dict[str, dict[str, Endpoint]]
+    redis_prefix: str = DEFAULT_PREFIX
 
     @classmethod
     def load(cls):
@@ -55,4 +58,5 @@ class Settings:
         return cls(os.getenv("HUB_HOST", "127.0.0.1"),
                    int(os.getenv("HUB_PORT", "8765")),
                    os.getenv("HUB_REDIS_URL", "redis://127.0.0.1:6379/0"),
-                   ttl, retry, tenants)
+                   ttl, retry, tenants,
+                   validate_prefix(os.getenv('HUB_REDIS_PREFIX', DEFAULT_PREFIX)))

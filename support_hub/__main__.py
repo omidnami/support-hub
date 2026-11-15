@@ -16,7 +16,7 @@ from .websocket_server import WebSocketServer
 async def main():
     settings = Settings.load()
     redis = Redis.from_url(settings.redis_url, decode_responses=True,
-                           socket_connect_timeout=5, socket_timeout=5)
+                           socket_connect_timeout=5, socket_timeout=5, protocol=2)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -27,7 +27,7 @@ async def main():
         if os.getenv("HUB_DB_NAME"):
             from .database import Database
             db = await Database.open()
-        store = RedisManager(redis, settings.ttl)
+        store = RedisManager(redis, settings.ttl, prefix=settings.redis_prefix)
         server = WebSocketServer(settings, store, db)
         allowed_origins = [x.strip() for x in os.getenv("HUB_ALLOWED_ORIGINS", "").split(",") if x.strip()]
         # With no global allowlist, dynamic tenant origins are checked at auth.

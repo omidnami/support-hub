@@ -19,7 +19,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.redis = Redis.from_url(os.environ["HUB_TEST_REDIS_URL"], decode_responses=True)
         self.tenant = "test-" + uuid4().hex
-        self.store = RedisManager(self.redis, ttl=3)
+        self.store = RedisManager(self.redis, ttl=3, prefix='hub-delivery-test:')
         settings = Settings("127.0.0.1", 0, "", 3, 0.2, {self.tenant: {
             "admin": Endpoint("a" * 32, frozenset({"public"})),
             "public": Endpoint("b" * 32, frozenset({"admin"})),
@@ -30,7 +30,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.server.close()
         await self.server.wait_closed()
-        keys = [k async for k in self.redis.scan_iter(match=f"support-hub:{{{self.tenant}}}:*")]
+        keys = [k async for k in self.redis.scan_iter(match=self.store.keys.tenant(self.tenant) + "*")]
         if keys:
             await self.redis.delete(*keys)
         await self.redis.aclose()

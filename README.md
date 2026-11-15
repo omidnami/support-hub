@@ -57,9 +57,9 @@ environment variables for development only. Peer allowlists are server-side; a c
 cannot select its source or another tenant. Do not expose privileged static credentials
 in public storefront JavaScript. Database mode supports scoped temporary visitor credentials and tenant provisioning. Each destination has a 1000 pending-message limit; a full queue
 returns destination_queue_full. Maximum inbound frame size is 64 KiB.
-Use restricted Redis access, noeviction and appropriate AOF persistence if pending
-messages must survive Redis restarts. Configure storage, expiry and backup policy
-according to the temporary nature of message payloads.
+All Redis keys share HUB_REDIS_PREFIX (default support-hub:). Use a dedicated ACL
+user and a reserved logical database on a shared server. Do not change global Redis
+settings without coordinating other workloads. See deploy/cpanel.md.
 
 Target: existing WHM/cPanel account planet, localhost service managed by systemd,
 Apache reverse proxy and cPanel AutoSSL. No changes to the hosting server are included
@@ -77,7 +77,8 @@ Keep this key private and backed up separately from the database. Never commit .
 Database mode overrides static endpoints.
 
     source .env
-    python -m support_hub.admin init-db
+    # For local development only: python -m support_hub.admin init-db
+    # On cPanel import schema.sql via phpMyAdmin instead.
     python -m support_hub.admin add-client shop1 admin --peer public
     python -m support_hub.admin add-client shop1 public --peer admin
     python -m support_hub.admin add-channel shop1 admin telegram
@@ -123,7 +124,7 @@ not unregister an upstream webhook. Disabled clients cannot send further frames;
 
 ## Central management API
 
-Run init-db on existing installations to apply the idempotent MariaDB migration.
+Apply schema.sql to the selected database via phpMyAdmin on cPanel; init-db is a local CLI alternative.
 Set HUB_MANAGEMENT_KEY to a unique random secret (32+ characters); routes are
 disabled if absent. Only the trusted central backend may possess this key.
 It grants access across tenants; never ship it to stores or browsers.
@@ -247,3 +248,13 @@ including public visitor isolation, credential refresh and offline delivery.
 MariaDB integration skips unless HUB_TEST_DB=1 with dedicated test DB settings.
 Stop the disposable Redis process with Ctrl+C when done. Never use production
 Redis or MariaDB for integration tests. No live bot tokens are needed.
+
+## Shared Redis and cPanel isolation
+
+See deploy/cpanel.md, deploy/cpanel.env.example and deploy/redis-acl.rules.example.
+HUB_REDIS_PREFIX is validated and used by messages, indexes, dedup receipts and
+browser sessions. Changing the prefix or Redis DB does not migrate existing data;
+keep them stable after rollout. The app never uses flush or global Redis commands.
+CI exercises scoped Redis ACL permissions on Redis 6.2 and 7.
+The database/user are provisioned in cPanel, and schema.sql is imported through
+phpMyAdmin into the selected database. Runtime does not create tables or users.

@@ -21,7 +21,7 @@ class WebSocketServer:
         self.settings = settings
         self.db = db
         self.store = store
-        self.sessions = BrowserSessions(store.redis, db) if db else None
+        self.sessions = BrowserSessions(store.redis, db, prefix=store.keys.prefix) if db else None
         self.clients = ClientManager()
         self.router = MessageRouter(store, self.clients)
         self.connection_rate = Bucket(80, 160)
