@@ -171,3 +171,21 @@ Browser origins are denied by default; HUB_ALLOWED_ORIGINS permits specified
 origins but never exposes a privileged token. Scoped short-lived browser
 credentials and multi-user browser routing remain future work.
 No public production deployment until further testing and hardening.
+
+## CI and cPanel deployment templates
+
+The GitHub Actions test job uses disposable Redis and MariaDB service containers.
+It does not use live provider credentials. Provider callbacks and sends still
+need explicit tests with real bots/accounts.
+
+For a local integration run, export HUB_TEST_DB=1 and HUB_DB_* for a dedicated
+test database, HUB_ENCRYPTION_KEY for a disposable Fernet key, and
+HUB_TEST_REDIS_URL for test Redis. Never point integration tests at production.
+
+Example files are in deploy/. They are not installed automatically. Adapt the
+systemd unit to the actual Python venv and keep .env mode 600 outside the public
+document root. Use cPanel's supported Apache userdata SSL vhost include mechanism
+for the chosen subdomain; validate the generated configuration before reloading.
+Do not replace the PlanetScripts virtual host or change global PHP settings.
+Keep management loopback-only unless there is a verified reason to expose it.
+Check both /health on localhost:8766 and the WS handshake before registering a bot.
