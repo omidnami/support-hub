@@ -1,14 +1,39 @@
 import hmac
-import json
+import logging
+import os
 
 from aiohttp import web
 from redis.exceptions import RedisError
 
+from .channels.instagram import valid_account, verified_signature
 from .database import digest
+from .management import install_management
 from .protocol import ProtocolError, decode
+from .security import Bucket
+
+log = logging.getLogger(__name__)
 
 
 def build_app(db, manager):
+    incoming = Bucket(200, 400)
+    meta_secret = os.getenv("HUB_META_APP_SECRET", "")
+    verify_token = os.getenv("HUB_META_VERIFY_TOKEN", "")
+    management_key = os.getenv("HUB_MANAGEMENT_KEY", "")
+
+    @web.middleware
+    async def protection(request, handler):
+        if not incoming.allow():
+            return web.json_response({"error": "rate_limited"}, status=429, headers={"Retry-After": "1"})
+        try:
+            response = await handler(request)
+        except web.HTTPException as exc:
+            response = exc
+        except Exception:
+            log.warning("HTTP request failed")
+            response = web.json_response({"error": "temporarily_unavailable"}, status=503)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
     async def health(request):
         try:
             await db.query("SELECT 1")
@@ -18,21 +43,18 @@ def build_app(db, manager):
         return web.json_response({"status": "ok"})
 
     async def webhook(request):
-        channel_id = request.match_info["channel_id"]
-        platform = request.match_info["platform"]
-        secret = request.match_info["secret"]
+        channel_id, platform, secret = (request.match_info[k] for k in ("channel_id", "platform", "secret"))
         if len(channel_id) != 32 or len(secret) > 128:
             raise web.HTTPNotFound()
         channel = await db.get_channel(channel_id)
-        if (not channel or channel.platform != platform or platform == "eitaa"
+        if (not channel or channel.platform != platform or platform in ("eitaa", "instagram")
                 or not hmac.compare_digest(channel.webhook_hash, digest(secret))):
             raise web.HTTPNotFound()
         if platform == "telegram" and not hmac.compare_digest(
             digest(request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")), channel.webhook_hash):
             raise web.HTTPForbidden()
         try:
-            body = decode(await request.text())
-            await manager.ingest(channel, body)
+            await manager.ingest(channel, decode(await request.text()))
         except ProtocolError as exc:
             if str(exc) == "destination_queue_full":
                 raise web.HTTPServiceUnavailable()
@@ -41,7 +63,43 @@ def build_app(db, manager):
             raise web.HTTPServiceUnavailable() from None
         return web.json_response({"ok": True})
 
-    app = web.Application(client_max_size=64 * 1024)
+    async def instagram_verify(request):
+        if not meta_secret or not verify_token:
+            raise web.HTTPNotFound()
+        query = request.query
+        if (query.get("hub.mode") != "subscribe"
+                or not hmac.compare_digest(digest(query.get("hub.verify_token", "")), digest(verify_token))
+                or "hub.challenge" not in query):
+            raise web.HTTPForbidden()
+        return web.Response(text=query["hub.challenge"])
+
+    async def instagram_webhook(request):
+        raw = await request.read()
+        if not meta_secret or not verified_signature(meta_secret, raw, request.headers.get("X-Hub-Signature-256", "")):
+            raise web.HTTPForbidden()
+        try:
+            body = decode(raw.decode("utf-8"))
+            if body.get("object") != "instagram" or not isinstance(body.get("entry"), list):
+                raise web.HTTPBadRequest()
+            for entry in body["entry"]:
+                if not isinstance(entry, dict) or not valid_account(str(entry.get("id", ""))):
+                    continue
+                channel = await db.instagram_channel(str(entry["id"]))
+                if channel:
+                    await manager.ingest(channel, {"object": "instagram", "entry": [entry]})
+        except (ProtocolError, RedisError) as exc:
+            if isinstance(exc, RedisError) or str(exc) == "destination_queue_full":
+                raise web.HTTPServiceUnavailable() from None
+            raise web.HTTPBadRequest() from None
+        except UnicodeError:
+            raise web.HTTPBadRequest() from None
+        return web.json_response({"ok": True})
+
+    app = web.Application(client_max_size=64 * 1024, middlewares=[protection])
     app.router.add_get("/health", health)
+    app.router.add_get("/webhook/instagram", instagram_verify)
+    app.router.add_post("/webhook/instagram", instagram_webhook)
     app.router.add_post("/webhook/{platform}/{channel_id}/{secret}", webhook)
+    if management_key:
+        install_management(app, db, manager, management_key)
     return app

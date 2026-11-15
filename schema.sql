@@ -26,3 +26,7 @@ CREATE TABLE IF NOT EXISTS options (
     name VARCHAR(100) NOT NULL PRIMARY KEY,
     value JSON NOT NULL
 ) ENGINE=InnoDB;
+
+ALTER TABLE channels ADD COLUMN IF NOT EXISTS provider_account_id VARCHAR(64)
+    CHARACTER SET ascii COLLATE ascii_bin NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS unique_provider_account ON channels(platform, provider_account_id);

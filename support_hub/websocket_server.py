@@ -10,6 +10,7 @@ from .config import valid_identifier
 from .message_router import MessageRouter
 from .pending_messages import deliver_pending
 from .protocol import ProtocolError, decode, encode
+from .security import Bucket
 
 log = logging.getLogger(__name__)
 
@@ -21,8 +22,14 @@ class WebSocketServer:
         self.store = store
         self.clients = ClientManager()
         self.router = MessageRouter(store, self.clients)
+        self.connection_rate = Bucket(80, 160)
+        self.active = 0
 
     async def handle(self, ws):
+        if self.active >= 2000 or not self.connection_rate.allow():
+            await ws.close(1013, 'server_busy')
+            return
+        self.active += 1
         client = None
         worker = None
         try:
@@ -54,9 +61,15 @@ class WebSocketServer:
                 return
             await ws.send(encode({"type": "authenticated", "endpoint": endpoint}))
             log.info("connected tenant=%s endpoint=%s", tenant, endpoint)
-            worker = asyncio.create_task(self._deliver(client))
+            async def authorized():
+                return await self.db.authorization(tenant, endpoint, token) is not None
+            worker = asyncio.create_task(self._deliver(client, authorized if self.db else None))
+            rate = Bucket(30, 60)
 
             async for raw in ws:
+                if not rate.allow():
+                    await ws.close(1008, 'rate_limited')
+                    return
                 try:
                     frame = None
                     if self.db:
@@ -78,21 +91,25 @@ class WebSocketServer:
         except (RedisError, TimeoutError):
             log.warning("connection interrupted by backend or send timeout")
             await ws.close(1011, "temporarily_unavailable")
+        except Exception:
+            log.warning('websocket backend failure')
+            await ws.close(1011, 'temporarily_unavailable')
         finally:
+            self.active -= 1
             if worker is not None:
                 worker.cancel()
                 await asyncio.gather(worker, return_exceptions=True)
             if client is not None:
                 self.clients.remove(client)
 
-    async def _deliver(self, client):
+    async def _deliver(self, client, authorized=None):
         try:
-            await deliver_pending(client, self.store, self.settings.retry)
+            await deliver_pending(client, self.store, self.settings.retry, authorized)
         except ConnectionClosed:
             pass
         except (RedisError, TimeoutError):
             log.warning("pending delivery interrupted")
             await client.socket.close(1011, "temporarily_unavailable")
         except Exception:
-            log.exception("pending delivery worker failed")
+            log.warning("pending delivery worker failed")
             await client.socket.close(1011, "delivery_failed")

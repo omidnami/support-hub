@@ -19,10 +19,10 @@ class Adapter:
     def __init__(self, http):
         self.http = http
 
-    async def request(self, url, data, form=False):
+    async def request(self, url, data, form=False, headers=None):
         try:
             kwargs = {"data" if form else "json": data}
-            async with self.http.post(url, allow_redirects=False, **kwargs) as response:
+            async with self.http.post(url, allow_redirects=False, headers=headers, **kwargs) as response:
                 if response.status == 429:
                     try:
                         delay = float(response.headers.get("Retry-After", "10"))

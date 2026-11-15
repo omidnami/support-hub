@@ -2,10 +2,13 @@ import asyncio
 import time
 
 
-async def deliver_pending(client, store, retry_seconds):
+async def deliver_pending(client, store, retry_seconds, authorized=None):
     """Retry until ACK or TTL. A reconnect starts with an empty in-flight map."""
     while True:
         client.wake.clear()
+        if authorized is not None and not await authorized():
+            await client.socket.close(1008, 'authorization_revoked')
+            return
         ids = await store.pending(client.tenant, client.endpoint)
         available = set(ids)
         for delivery_id in list(client.in_flight):

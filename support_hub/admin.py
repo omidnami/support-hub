@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from .database import Database
 from .channels import ADAPTERS
+from .channels.instagram import valid_account
 
 
 async def run(args):
@@ -24,8 +25,13 @@ async def run(args):
             if not token:
                 raise ValueError("token required")
             channel_id, hook = uuid4().hex, secrets.token_urlsafe(32)
-            await db.add_channel(channel_id, args.tenant, args.owner, args.platform,
-                                 {"token": token, "webhook_secret": hook}, hook)
+            credentials = {"token": token, "webhook_secret": hook}
+            if args.platform == "instagram":
+                account = input("Instagram professional account ID: ").strip()
+                if not valid_account(account):
+                    raise ValueError("invalid account ID")
+                credentials["account_id"] = account
+            await db.add_channel(channel_id, args.tenant, args.owner, args.platform, credentials, hook)
             print("Channel ID:", channel_id)
             print("Destination endpoint:", "ch-" + channel_id)
             print("Webhook secret (save securely):", hook)

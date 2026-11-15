@@ -90,10 +90,15 @@ class Database:
             (tenant, endpoint, digest(token), json.dumps(peers)), write=True)
 
     async def add_channel(self, channel_id, tenant, owner, platform, credentials, hook):
+        if not await self.query(
+                "SELECT endpoint FROM clients WHERE tenant=%s AND endpoint=%s AND enabled=1",
+                (tenant, owner)):
+            raise ValueError("owner_not_found")
+        provider_account = credentials.get("account_id") if platform == "instagram" else None
         encrypted = self.cipher.encrypt(json.dumps(credentials).encode())
         await self.query(
-            "INSERT INTO channels (id,tenant,endpoint,owner_endpoint,platform,credentials,webhook_hash)"
-            " VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            "INSERT INTO channels (id,tenant,endpoint,owner_endpoint,platform,credentials,webhook_hash,provider_account_id)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
             (channel_id, tenant, "ch-" + channel_id, owner, platform, encrypted, digest(hook)),
             write=True)
 
@@ -114,3 +119,22 @@ class Database:
             "SELECT c.* FROM channels c JOIN clients t ON t.tenant=c.tenant "
             "AND t.endpoint=c.owner_endpoint WHERE c.enabled=1 AND t.enabled=1")
         return [self.channel(row) for row in rows]
+
+    async def instagram_channel(self, account_id):
+        rows = await self.query(
+            "SELECT c.* FROM channels c JOIN clients t ON t.tenant=c.tenant "
+            "AND t.endpoint=c.owner_endpoint WHERE c.platform='instagram' "
+            "AND c.provider_account_id=%s AND c.enabled=1 AND t.enabled=1",
+            (account_id,))
+        return self.channel(rows[0]) if rows else None
+
+    async def list_clients(self, tenant):
+        rows = await self.query(
+            "SELECT tenant,endpoint,peers,enabled FROM clients WHERE tenant=%s ORDER BY endpoint", (tenant,))
+        return [{**r, "enabled": bool(r["enabled"]), "peers": json.loads(r["peers"])} for r in rows]
+
+    async def list_channels(self, tenant):
+        rows = await self.query(
+            "SELECT id,tenant,endpoint,owner_endpoint,platform,enabled,provider_account_id "
+            "FROM channels WHERE tenant=%s ORDER BY id", (tenant,))
+        return [{**r, "enabled": bool(r["enabled"])} for r in rows]

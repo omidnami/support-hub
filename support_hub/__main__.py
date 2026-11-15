@@ -42,7 +42,7 @@ async def main():
                     task = asyncio.create_task(manager.run())
                 async with serve(server.handle, settings.host, settings.port, max_size=64 * 1024,
                                  max_queue=16, ping_interval=20, ping_timeout=20,
-                                 compression=None):
+                                 compression=None, origins=[None, *[x.strip() for x in os.getenv('HUB_ALLOWED_ORIGINS', '').split(',') if x.strip()]]):
                     logging.info("Support Hub listening on %s:%s", settings.host, settings.port)
                     await stop.wait()
             finally:
