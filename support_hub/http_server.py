@@ -52,6 +52,7 @@ def build_app(db, manager):
             raise web.HTTPNotFound()
         channel = await db.get_channel(channel_id)
         if (not channel or channel.platform != platform or platform in ("eitaa", "instagram")
+                or channel.receive_mode != "webhook"
                 or not hmac.compare_digest(channel.webhook_hash, digest(secret))):
             raise web.HTTPNotFound()
         if platform == "telegram" and not hmac.compare_digest(

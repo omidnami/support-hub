@@ -46,15 +46,28 @@ async def run(args):
         elif args.command == "disable-channel":
             await db.query("UPDATE channels SET enabled=0 WHERE tenant=%s AND id=%s",
                            (args.tenant, args.id), write=True)
-        elif args.command == "set-webhook":
+        elif args.command in ("set-webhook", "set-polling"):
             import aiohttp
             channel = await db.get_channel(args.id)
             if not channel or channel.tenant != args.tenant:
                 raise ValueError("channel not found")
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as http:
                 adapter = ADAPTERS[channel.platform](http)
-                await adapter.register(channel, args.base_url.rstrip("/"))
-            print("webhook registered")
+                if args.command == "set-polling":
+                    if channel.platform != "bale":
+                        raise ValueError("polling currently supported only for Bale")
+                    for other in await db.active_channels():
+                        if (other.id != channel.id and other.platform == "bale"
+                                and other.credentials["token"] == channel.credentials["token"]):
+                            raise ValueError(f"Duplicate active Bale bot: {other.id}; disable it first")
+                    await adapter.unregister(channel)
+                    await db.set_receive_mode(channel.id, "polling")
+                    print("Bale polling enabled")
+                else:
+                    await adapter.register(channel, args.base_url.rstrip("/"))
+                    if channel.platform == "bale":
+                        await db.set_receive_mode(channel.id, "webhook")
+                    print("webhook registered")
     finally:
         await db.close()
 
@@ -83,6 +96,9 @@ def main():
     c.add_argument("tenant")
     c.add_argument("id")
     c.add_argument("base_url")
+    c = sub.add_parser("set-polling", help="Enable Bale polling while service is stopped")
+    c.add_argument("tenant")
+    c.add_argument("id")
     asyncio.run(run(parser.parse_args()))
 
 

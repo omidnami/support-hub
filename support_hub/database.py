@@ -24,6 +24,8 @@ class Channel:
     platform: str
     credentials: dict
     webhook_hash: str
+    receive_mode: str = 'webhook'
+    poll_offset: int = 0
 
 
 class Database:
@@ -121,7 +123,7 @@ class Database:
     def channel(self, row):
         return Channel(row["id"], row["tenant"], row["endpoint"], row["owner_endpoint"],
                        row["platform"], json.loads(self.cipher.decrypt(row["credentials"].encode("ascii") if isinstance(row["credentials"], str) else row["credentials"])),
-                       row["webhook_hash"])
+                       row["webhook_hash"], row["receive_mode"], row["poll_offset"])
 
     async def get_channel(self, channel_id):
         rows = await self.query(
@@ -135,6 +137,26 @@ class Database:
             "SELECT c.* FROM channels c JOIN clients t ON t.tenant=c.tenant "
             "AND t.endpoint=c.owner_endpoint WHERE c.enabled=1 AND t.enabled=1")
         return [self.channel(row) for row in rows]
+
+    async def polling_channels(self):
+        rows = await self.query(
+            "SELECT c.* FROM channels c JOIN clients t ON t.tenant=c.tenant "
+            "AND t.endpoint=c.owner_endpoint WHERE c.enabled=1 AND t.enabled=1 "
+            "AND c.platform='bale' AND c.receive_mode='polling' ORDER BY c.id")
+        return [self.channel(row) for row in rows]
+
+    async def set_receive_mode(self, channel_id, mode):
+        if mode not in ("polling", "webhook"):
+            raise ValueError("invalid receive mode")
+        return await self.query(
+            "UPDATE channels SET receive_mode=%s WHERE id=%s AND platform='bale' AND enabled=1",
+            (mode, channel_id), write=True)
+
+    async def advance_poll_offset(self, channel_id, offset):
+        return await self.query(
+            "UPDATE channels SET poll_offset=%s WHERE id=%s AND enabled=1 "
+            "AND receive_mode='polling' AND poll_offset<%s",
+            (offset, channel_id, offset), write=True)
 
     async def instagram_channel(self, account_id):
         rows = await self.query(
@@ -151,6 +173,6 @@ class Database:
 
     async def list_channels(self, tenant):
         rows = await self.query(
-            "SELECT id,tenant,endpoint,owner_endpoint,platform,enabled,provider_account_id "
+            "SELECT id,tenant,endpoint,owner_endpoint,platform,enabled,provider_account_id,receive_mode "
             "FROM channels WHERE tenant=%s ORDER BY id", (tenant,))
         return [{**r, "enabled": bool(r["enabled"])} for r in rows]

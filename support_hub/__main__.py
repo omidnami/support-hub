@@ -21,7 +21,8 @@ async def main():
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
-    db = runner = task = None
+    db = runner = None
+    tasks = []
     try:
         await redis.ping()
         if os.getenv("HUB_DB_NAME"):
@@ -34,7 +35,9 @@ async def main():
         # Permanent client tokens are still never accepted with an Origin header.
         origins = [None, *allowed_origins] if allowed_origins else (None if db else [None])
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15),
-                                         connector=aiohttp.TCPConnector(limit=30)) as http:
+                                         connector=aiohttp.TCPConnector(limit=30)) as http, \
+                aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25),
+                                      connector=aiohttp.TCPConnector(limit=20)) as poll_http:
             try:
                 if db:
                     from .channel_manager import ChannelManager
@@ -43,7 +46,9 @@ async def main():
                     runner = web.AppRunner(build_app(db, manager), access_log=None)
                     await runner.setup()
                     await web.TCPSite(runner, settings.host, int(os.getenv("HUB_HTTP_PORT", "8766"))).start()
-                    task = asyncio.create_task(manager.run())
+                    tasks.append(asyncio.create_task(manager.run()))
+                    from .polling import BalePolling
+                    tasks.append(asyncio.create_task(BalePolling(db, manager, poll_http).run()))
                 async with serve(server.handle, settings.host, settings.port, max_size=64 * 1024,
                                  max_queue=16, ping_interval=20, ping_timeout=20,
                                  compression=None, origins=origins):
@@ -52,9 +57,9 @@ async def main():
             finally:
                 if runner:
                     await runner.cleanup()
-                if task:
+                for task in tasks:
                     task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+                await asyncio.gather(*tasks, return_exceptions=True)
     finally:
         if db:
             await db.close()

@@ -55,6 +55,19 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         public = await self.db.list_channels(self.tenant)
         self.assertNotIn("credentials", public[0])
 
+    async def test_bale_polling_mode_and_cursor(self):
+        await self.db.add_client(self.tenant, "admin", uuid4().hex + uuid4().hex, [])
+        cid = uuid4().hex
+        await self.db.add_channel(cid, self.tenant, "admin", "bale", {"token":"test"}, "hook")
+        self.assertEqual((await self.db.get_channel(cid)).receive_mode, "webhook")
+        await self.db.set_receive_mode(cid, "polling")
+        self.assertIn(cid, [c.id for c in await self.db.polling_channels()])
+        self.assertTrue(await self.db.advance_poll_offset(cid, 42))
+        self.assertFalse(await self.db.advance_poll_offset(cid, 41))
+        self.assertEqual((await self.db.get_channel(cid)).poll_offset, 42)
+        await self.db.set_receive_mode(cid, "webhook")
+        self.assertFalse(await self.db.advance_poll_offset(cid, 43))
+
     async def test_instagram_account_lookup(self):
         token = uuid4().hex + uuid4().hex
         await self.db.add_client(self.tenant, "admin", token, [])

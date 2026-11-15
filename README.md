@@ -314,3 +314,35 @@ Application tables: clients (tenant + endpoint primary key, unique token hash);
 channels (primary ID, unique tenant/endpoint, owner composite foreign key to
 clients, unique platform/provider account); options (name primary key).
 migrations is infrastructure metadata, not application or customer history.
+
+## Bale: official webhook and long polling
+
+Reference: https://docs.bale.ai/ (Update, getUpdates, setWebhook, deleteWebhook,
+getWebhookInfo, sendMessage). The two receive methods are alternatives and
+use the same update format. Webhook is the default for existing channels.
+If provider-to-server callbacks fail but the API is reachable, enable polling:
+
+    # Stop the service first (root); then as the project owner:
+    source .env
+    .venv/bin/python -m support_hub.admin migrate
+    .venv/bin/python -m support_hub.admin set-polling TENANT CHANNEL_ID
+    # Restart the service as root.
+
+This deletes the registered upstream webhook before selecting polling. Do not
+run another getUpdates client for this bot. Only one active channel per bot
+token should exist; set-polling rejects active duplicates. To return to webhook,
+stop the service and use set-webhook TENANT CHANNEL_ID HTTPS_BASE_URL, then start.
+Use the same channel ID to retain message routing. No automatic mode switching.
+The management register endpoint rejects polling channels.
+
+A single shared scheduler uses a separate HTTP session (20 concurrent polls,
+10-second provider timeout, 25-second HTTP timeout). It retries on failure
+without blocking outbound sends. It saves the next update offset in MariaDB
+after ingestion in Redis; unsupported update types are consumed by design.
+The offset survives restarts. Existing Redis retention/delivery semantics apply:
+if Redis loses accepted messages after the offset is saved, they cannot be
+recovered by polling. No permanent message history is introduced. Capacity
+beyond the configured concurrent polls requires load testing. Provider
+callbacks on this host remain unverified; real outbound replies must be tested.
+
+Migrations 0006 and 0007 add receive_mode and poll_offset to channels.

@@ -109,6 +109,8 @@ def install_management(app, db, manager, secret):
             return web.json_response({"enabled": False})
         if request.match_info["action"] != "register":
             raise web.HTTPNotFound()
+        if channel.receive_mode == "polling":
+            raise web.HTTPConflict(text="Switch polling mode with local admin CLI")
         base = os.getenv("HUB_PUBLIC_BASE_URL", "").rstrip("/")
         if not base and channel.platform != "instagram":
             raise web.HTTPServiceUnavailable()
