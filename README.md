@@ -55,9 +55,7 @@ tenant keys and clean them up. The second command exercises real Redis and WebSo
 Single process, one active socket per tenant endpoint; endpoints are provisioned in
 environment variables for development only. Peer allowlists are server-side; a client
 cannot select its source or another tenant. Do not expose privileged static credentials
-in public storefront JavaScript. Browser short-lived scoped credentials, origin policy,
-rate limits and MariaDB-backed tenant/channel provisioning are future work before
-public deployment. Each destination has a 1000 pending-message limit; a full queue
+in public storefront JavaScript. Database mode supports scoped temporary visitor credentials and tenant provisioning. Each destination has a 1000 pending-message limit; a full queue
 returns destination_queue_full. Maximum inbound frame size is 64 KiB.
 Use restricted Redis access, noeviction and appropriate AOF persistence if pending
 messages must survive Redis restarts. Configure storage, expiry and backup policy
@@ -111,7 +109,7 @@ present. Permanent rejection is removed and reported via a best-effort delivery_
 event; sent denotes provider acceptance, not customer read/delivery. A provider may
 receive a duplicate if its send succeeded but the Redis ACK failed. The sweep is
 single-process, bounded concurrency, and checks all active channels; load testing,
-durable delivery receipts and scoped browser credentials remain required before public deployment. No permanent customer
+durable delivery receipts and production hardening remain required before public deployment. No permanent customer
 directory, bot-per-process model, or UI. Provider access from the hosting network
 must be verified separately.
 
@@ -167,9 +165,9 @@ Process-local limits: 2000 concurrent WebSocket handlers, 80 new connections/s
 5/s (burst 20). These defaults are not capacity measurements or DDoS protection.
 Configure Apache access logs to exclude secret callback paths and verify-token
 query strings. App HTTP access logging is disabled; errors are redacted.
-Browser origins are denied by default; HUB_ALLOWED_ORIGINS permits specified
-origins but never exposes a privileged token. Scoped short-lived browser
-credentials and multi-user browser routing remain future work.
+A browser may authenticate only with a scoped visitor token bound to its exact origin.
+HUB_ALLOWED_ORIGINS optionally further restricts the global handshake. Permanent
+server tokens must never be delivered to browsers.
 No public production deployment until further testing and hardening.
 
 ## CI and cPanel deployment templates
@@ -189,3 +187,63 @@ for the chosen subdomain; validate the generated configuration before reloading.
 Do not replace the PlanetScripts virtual host or change global PHP settings.
 Keep management loopback-only unless there is a verified reason to expose it.
 Check both /health on localhost:8766 and the WS handshake before registering a bot.
+
+## Public browser sessions
+
+No customer table or permanent customer data is created in Support Hub.
+Planet's backend authenticates its visitor locally, generates a cryptographically
+random session_id (32–128 URL-safe characters), and retains it server-side.
+Do not use a visitor-supplied session ID or allow visitors to choose their own origin.
+
+From the trusted Planet backend, not from browser JavaScript:
+
+    POST /v1/tenants/shop1/clients/admin/browser-sessions
+    Authorization: Bearer <shop1 admin endpoint token>
+    Content-Type: application/json
+
+    {"session_id":"<random-server-generated-stable-id>","origin":"https://shop.example.com"}
+
+The response contains tenant, endpoint (web-...), token, expires_in (900 seconds),
+and owner_endpoint. Return only the scoped response to the authorized visitor.
+Use the normal WebSocket auth frame with this token and endpoint from the browser.
+The origin is verified against the session record; the browser cannot authenticate
+as a permanent endpoint. A visitor can send only to its owner. The owner replies
+to the exact web-... source ID received in the message envelope. Payloads are
+untrusted content: the envelope's tenant and source, not payload claims, identify peers.
+
+Each visitor has a distinct endpoint; a single active connection per endpoint is
+supported. Refresh uses the same server-side session_id, owner and tenant,
+preserving the endpoint and rotating the token. The previous token is invalidated;
+close its connection before reconnecting. Token expires after 15 minutes; refresh
+from the trusted backend before expiry. Redis routing metadata lasts five hours
+from issuance or a reply queued by its owner; message TTL is independent. Once
+routing metadata expires, the backend can reissue from the retained session_id.
+No history stored permanently. Signed origin-bound visitor credentials and server
+authentication do not replace storefront visitor authorization, CSRF protection,
+abuse controls, or per-customer authorization on the Planet backend.
+
+The session issuer uses the tenant endpoint token instead of the global management
+key. If the issuer needs remote access, expose only that route through the Hub
+subdomain; the central management API stays private by default. No CORS is needed
+for this backend-to-backend request. The normal local WebSocket tests may use
+http://localhost:<port> as the exact browser origin.
+
+## First local test (Ubuntu)
+
+Clone the repository and create a virtual environment. Install Redis locally
+if it is not already available. For a disposable separate test process:
+
+    redis-server --bind 127.0.0.1 --port 6389 --save "" --appendonly no
+
+Leave that terminal running. In the project terminal:
+
+    python3 -m venv .venv
+    source .venv/bin/activate
+    pip install -r requirements.txt
+    HUB_TEST_REDIS_URL=redis://127.0.0.1:6389/0 python -m unittest discover -s tests -v
+
+This runs protocol, provider fixture, HTTP management and Redis/WebSocket tests,
+including public visitor isolation, credential refresh and offline delivery.
+MariaDB integration skips unless HUB_TEST_DB=1 with dedicated test DB settings.
+Stop the disposable Redis process with Ctrl+C when done. Never use production
+Redis or MariaDB for integration tests. No live bot tokens are needed.

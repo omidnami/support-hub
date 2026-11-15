@@ -5,6 +5,8 @@ import os
 from aiohttp import web
 from redis.exceptions import RedisError
 
+from .browser_sessions import BrowserSessions
+from .config import valid_identifier
 from .channels.instagram import valid_account, verified_signature
 from .database import digest
 from .management import install_management
@@ -19,6 +21,7 @@ def build_app(db, manager):
     meta_secret = os.getenv("HUB_META_APP_SECRET", "")
     verify_token = os.getenv("HUB_META_VERIFY_TOKEN", "")
     management_key = os.getenv("HUB_MANAGEMENT_KEY", "")
+    session_rate = Bucket(20, 40)
 
     @web.middleware
     async def protection(request, handler):
@@ -95,8 +98,28 @@ def build_app(db, manager):
             raise web.HTTPBadRequest() from None
         return web.json_response({"ok": True})
 
+    async def browser_session(request):
+        # Planet's backend issues this for the authorized visitor. No browser
+        # origin or tenant-wide management key is accepted as a substitute.
+        tenant, owner = (request.match_info[k] for k in ("tenant", "owner"))
+        header = request.headers.get("Authorization", "")
+        if (request.headers.get("Origin") is not None or not valid_identifier(tenant)
+                or not valid_identifier(owner) or not header.startswith("Bearer ")
+                or len(header) > 512 or not await db.verify_client(tenant, owner, header[7:])):
+            raise web.HTTPUnauthorized()
+        if not session_rate.allow():
+            raise web.HTTPTooManyRequests(headers={"Retry-After": "1"})
+        try:
+            body = decode(await request.text())
+            sessions = BrowserSessions(manager.store.redis, db)
+            result = await sessions.issue(tenant, owner, body.get("session_id"), body.get("origin"))
+        except (ValueError, ProtocolError):
+            raise web.HTTPBadRequest() from None
+        return web.json_response(result, status=201)
+
     app = web.Application(client_max_size=64 * 1024, middlewares=[protection])
     app.router.add_get("/health", health)
+    app.router.add_post("/v1/tenants/{tenant}/clients/{owner}/browser-sessions", browser_session)
     app.router.add_get("/webhook/instagram", instagram_verify)
     app.router.add_post("/webhook/instagram", instagram_webhook)
     app.router.add_post("/webhook/{platform}/{channel_id}/{secret}", webhook)

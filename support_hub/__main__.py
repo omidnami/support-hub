@@ -29,6 +29,10 @@ async def main():
             db = await Database.open()
         store = RedisManager(redis, settings.ttl)
         server = WebSocketServer(settings, store, db)
+        allowed_origins = [x.strip() for x in os.getenv("HUB_ALLOWED_ORIGINS", "").split(",") if x.strip()]
+        # With no global allowlist, dynamic tenant origins are checked at auth.
+        # Permanent client tokens are still never accepted with an Origin header.
+        origins = [None, *allowed_origins] if allowed_origins else (None if db else [None])
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15),
                                          connector=aiohttp.TCPConnector(limit=30)) as http:
             try:
@@ -42,7 +46,7 @@ async def main():
                     task = asyncio.create_task(manager.run())
                 async with serve(server.handle, settings.host, settings.port, max_size=64 * 1024,
                                  max_queue=16, ping_interval=20, ping_timeout=20,
-                                 compression=None, origins=[None, *[x.strip() for x in os.getenv('HUB_ALLOWED_ORIGINS', '').split(',') if x.strip()]]):
+                                 compression=None, origins=origins):
                     logging.info("Support Hub listening on %s:%s", settings.host, settings.port)
                     await stop.wait()
             finally:

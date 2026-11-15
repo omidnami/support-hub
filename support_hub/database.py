@@ -57,6 +57,18 @@ class Database:
             if statement.strip():
                 await self.query(statement, write=True)
 
+    async def client_enabled(self, tenant, endpoint):
+        rows = await self.query(
+            "SELECT 1 FROM clients WHERE tenant=%s AND endpoint=%s AND enabled=1",
+            (tenant, endpoint))
+        return bool(rows)
+
+    async def verify_client(self, tenant, endpoint, token):
+        rows = await self.query(
+            "SELECT token_hash FROM clients WHERE tenant=%s AND endpoint=%s AND enabled=1",
+            (tenant, endpoint))
+        return bool(rows and hmac.compare_digest(rows[0]["token_hash"], digest(token)))
+
     async def authenticate(self, tenant, endpoint, token):
         rows = await self.query(
             "SELECT token_hash FROM clients WHERE tenant=%s AND endpoint=%s AND enabled=1",
@@ -81,9 +93,9 @@ class Database:
         return Endpoint("", frozenset(allowed))
 
     async def add_client(self, tenant, endpoint, token, peers):
-        if not valid_identifier(tenant) or not valid_identifier(endpoint) or endpoint.startswith("ch-"):
+        if not valid_identifier(tenant) or not valid_identifier(endpoint) or endpoint.startswith(("ch-", "web-")):
             raise ValueError("invalid tenant or reserved endpoint")
-        if not all(valid_identifier(p) and p != endpoint and not p.startswith("ch-") for p in peers):
+        if not all(valid_identifier(p) and p != endpoint and not p.startswith(("ch-", "web-")) for p in peers):
             raise ValueError("invalid peers")
         await self.query(
             "INSERT INTO clients (tenant,endpoint,token_hash,peers) VALUES (%s,%s,%s,%s)",
@@ -95,7 +107,7 @@ class Database:
                 (tenant, owner)):
             raise ValueError("owner_not_found")
         provider_account = credentials.get("account_id") if platform == "instagram" else None
-        encrypted = self.cipher.encrypt(json.dumps(credentials).encode())
+        encrypted = self.cipher.encrypt(json.dumps(credentials).encode()).decode("ascii")
         await self.query(
             "INSERT INTO channels (id,tenant,endpoint,owner_endpoint,platform,credentials,webhook_hash,provider_account_id)"
             " VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
@@ -104,7 +116,7 @@ class Database:
 
     def channel(self, row):
         return Channel(row["id"], row["tenant"], row["endpoint"], row["owner_endpoint"],
-                       row["platform"], json.loads(self.cipher.decrypt(row["credentials"])),
+                       row["platform"], json.loads(self.cipher.decrypt(row["credentials"].encode("ascii") if isinstance(row["credentials"], str) else row["credentials"])),
                        row["webhook_hash"])
 
     async def get_channel(self, channel_id):

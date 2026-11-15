@@ -4,12 +4,16 @@ import time
 
 async def deliver_pending(client, store, retry_seconds, authorized=None):
     """Retry until ACK or TTL. A reconnect starts with an empty in-flight map."""
+    last_check = 0.0
     while True:
         client.wake.clear()
-        if authorized is not None and not await authorized():
-            await client.socket.close(1008, 'authorization_revoked')
-            return
         ids = await store.pending(client.tenant, client.endpoint)
+        # Verify before delivering data and at least every five seconds while idle.
+        if authorized is not None and (ids or time.monotonic() - last_check >= 5):
+            if not await authorized():
+                await client.socket.close(1008, "authorization_revoked")
+                return
+            last_check = time.monotonic()
         available = set(ids)
         for delivery_id in list(client.in_flight):
             if delivery_id not in available:

@@ -5,6 +5,7 @@ import logging
 from redis.exceptions import RedisError
 from websockets.exceptions import ConnectionClosed
 
+from .browser_sessions import BrowserSessions, is_browser_endpoint
 from .client_manager import Client, ClientManager
 from .config import valid_identifier
 from .message_router import MessageRouter
@@ -20,6 +21,7 @@ class WebSocketServer:
         self.settings = settings
         self.db = db
         self.store = store
+        self.sessions = BrowserSessions(store.redis, db) if db else None
         self.clients = ClientManager()
         self.router = MessageRouter(store, self.clients)
         self.connection_rate = Bucket(80, 160)
@@ -27,7 +29,7 @@ class WebSocketServer:
 
     async def handle(self, ws):
         if self.active >= 2000 or not self.connection_rate.allow():
-            await ws.close(1013, 'server_busy')
+            await ws.close(1013, "server_busy")
             return
         self.active += 1
         client = None
@@ -42,46 +44,66 @@ class WebSocketServer:
                 await ws.close(1008, "authentication_required")
                 return
             tenant, endpoint, token = (frame.get(k) for k in ("tenant", "endpoint", "token"))
-            entry = None
-            if (frame.get("type") == "auth" and valid_identifier(tenant)
-                    and valid_identifier(endpoint) and isinstance(token, str) and len(token) <= 256):
-                if self.db:
-                    entry = await self.db.authenticate(tenant, endpoint, token)
-                else:
-                    candidate = self.settings.endpoints.get(tenant, {}).get(endpoint)
-                    if candidate and hmac.compare_digest(candidate.token.encode(), token.encode("utf-8", errors="surrogatepass")):
-                        entry = candidate
-            if entry is None:
+            origin = ws.request.headers.get("Origin")
+            browser = bool(self.sessions and is_browser_endpoint(endpoint))
+            if (frame.get("type") != "auth" or not valid_identifier(tenant)
+                    or not valid_identifier(endpoint) or not isinstance(token, str)
+                    or not 1 <= len(token) <= 256):
                 await ws.close(1008, "authentication_failed")
                 return
 
+            async def authorization():
+                if browser:
+                    return await self.sessions.authenticate(tenant, endpoint, token, origin)
+                if origin is not None or endpoint.startswith("web-"):
+                    # Browser clients never use permanent server credentials.
+                    return None
+                if self.db:
+                    return await self.db.authorization(tenant, endpoint, token)
+                candidate = self.settings.endpoints.get(tenant, {}).get(endpoint)
+                if candidate and hmac.compare_digest(candidate.token.encode(),
+                        token.encode("utf-8", errors="surrogatepass")):
+                    return candidate
+                return None
+
+            entry = await authorization()
+            if entry is None:
+                await ws.close(1008, "authentication_failed")
+                return
             client = Client(tenant, endpoint, ws)
             if not self.clients.register(client):
                 await ws.close(1008, "endpoint_already_connected")
                 return
             await ws.send(encode({"type": "authenticated", "endpoint": endpoint}))
             log.info("connected tenant=%s endpoint=%s", tenant, endpoint)
+
             async def authorized():
-                return await self.db.authorization(tenant, endpoint, token) is not None
+                return await authorization() is not None
+
             worker = asyncio.create_task(self._deliver(client, authorized if self.db else None))
             rate = Bucket(30, 60)
-
             async for raw in ws:
                 if not rate.allow():
-                    await ws.close(1008, 'rate_limited')
+                    await ws.close(1008, "rate_limited")
                     return
+                frame = None
                 try:
-                    frame = None
                     if self.db:
-                        entry = await self.db.authorization(tenant, endpoint, token)
+                        entry = await authorization()
                         if entry is None:
                             await ws.close(1008, "authorization_revoked")
                             return
                     frame = decode(raw)
-                    response = await self.router.handle(client, entry.peers, frame)
+                    peers = entry.peers
+                    destination = frame.get("to")
+                    if (self.sessions and not browser and frame.get("type") == "message"
+                            and is_browser_endpoint(destination)
+                            and await self.sessions.owns(tenant, endpoint, destination)):
+                        peers = peers | {destination}
+                    response = await self.router.handle(client, peers, frame)
                 except ProtocolError as exc:
                     response = {"type": "error", "code": str(exc)}
-                    if isinstance(locals().get("frame"), dict):
+                    if isinstance(frame, dict):
                         mid = frame.get("id")
                         if isinstance(mid, str) and len(mid) <= 64:
                             response["id"] = mid
@@ -92,8 +114,8 @@ class WebSocketServer:
             log.warning("connection interrupted by backend or send timeout")
             await ws.close(1011, "temporarily_unavailable")
         except Exception:
-            log.warning('websocket backend failure')
-            await ws.close(1011, 'temporarily_unavailable')
+            log.warning("websocket backend failure")
+            await ws.close(1011, "temporarily_unavailable")
         finally:
             self.active -= 1
             if worker is not None:

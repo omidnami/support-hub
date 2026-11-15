@@ -1,10 +1,10 @@
-# Include inside the SSL virtual host for the chosen Hub subdomain, NOT in
-# the existing PlanetScripts site's vhost. Verify enabled proxy modules first.
+# Include only in the Hub subdomain SSL vhost, not PlanetScripts' main vhost.
 ProxyRequests Off
 ProxyPass "/ws" "ws://127.0.0.1:8765/ws"
 ProxyPassReverse "/ws" "ws://127.0.0.1:8765/ws"
 ProxyPass "/webhook/" "http://127.0.0.1:8766/webhook/"
 ProxyPassReverse "/webhook/" "http://127.0.0.1:8766/webhook/"
-# Management stays loopback-only by default. Never log webhook callback
-# secrets in URLs or query strings. Configure vhost access logs accordingly
-# before enabling actual provider callbacks.
+# Optional: expose ONLY the owner-authenticated session issuer to remote stores.
+# ProxyPassMatch "^(/v1/tenants/[A-Za-z0-9_-]+/clients/[A-Za-z0-9_-]+/browser-sessions)$" "http://127.0.0.1:8766$1"
+# Management stays loopback-only. Never log callback secrets in URL paths or
+# query strings. Apply the site's access-log and request-size/rate policies.

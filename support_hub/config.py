@@ -37,7 +37,7 @@ class Settings:
                 raise ValueError("Invalid tenant configuration")
             tenants[tenant] = {}
             for name, entry in entries.items():
-                if not valid_identifier(name) or not isinstance(entry, dict):
+                if not valid_identifier(name) or name.startswith(('web-', 'ch-')) or not isinstance(entry, dict):
                     raise ValueError("Invalid endpoint configuration")
                 token, peers = entry.get("token"), entry.get("peers")
                 if (not isinstance(token, str) or len(token) < 32
