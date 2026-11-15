@@ -27,8 +27,8 @@ class Settings:
 
     @classmethod
     def load(cls):
-        raw = json.loads(os.environ["HUB_ENDPOINTS"])
-        if not isinstance(raw, dict) or not raw:
+        raw = json.loads(os.getenv("HUB_ENDPOINTS", "{}"))
+        if not isinstance(raw, dict) or (not raw and not os.getenv("HUB_DB_NAME")):
             raise ValueError("HUB_ENDPOINTS must be a nonempty tenant mapping")
         tenants = {}
         tokens = set()

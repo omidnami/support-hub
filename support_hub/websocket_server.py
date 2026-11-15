@@ -15,8 +15,9 @@ log = logging.getLogger(__name__)
 
 
 class WebSocketServer:
-    def __init__(self, settings, store):
+    def __init__(self, settings, store, db=None):
         self.settings = settings
+        self.db = db
         self.store = store
         self.clients = ClientManager()
         self.router = MessageRouter(store, self.clients)
@@ -35,11 +36,15 @@ class WebSocketServer:
                 return
             tenant, endpoint, token = (frame.get(k) for k in ("tenant", "endpoint", "token"))
             entry = None
-            if valid_identifier(tenant) and valid_identifier(endpoint):
-                entry = self.settings.endpoints.get(tenant, {}).get(endpoint)
-            if (frame.get("type") != "auth" or entry is None
-                    or not isinstance(token, str)
-                    or not hmac.compare_digest(entry.token.encode(), token.encode("utf-8", errors="surrogatepass"))):
+            if (frame.get("type") == "auth" and valid_identifier(tenant)
+                    and valid_identifier(endpoint) and isinstance(token, str) and len(token) <= 256):
+                if self.db:
+                    entry = await self.db.authenticate(tenant, endpoint, token)
+                else:
+                    candidate = self.settings.endpoints.get(tenant, {}).get(endpoint)
+                    if candidate and hmac.compare_digest(candidate.token.encode(), token.encode("utf-8", errors="surrogatepass")):
+                        entry = candidate
+            if entry is None:
                 await ws.close(1008, "authentication_failed")
                 return
 
@@ -53,6 +58,12 @@ class WebSocketServer:
 
             async for raw in ws:
                 try:
+                    frame = None
+                    if self.db:
+                        entry = await self.db.authorization(tenant, endpoint, token)
+                        if entry is None:
+                            await ws.close(1008, "authorization_revoked")
+                            return
                     frame = decode(raw)
                     response = await self.router.handle(client, entry.peers, frame)
                 except ProtocolError as exc:

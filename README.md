@@ -68,7 +68,60 @@ Apache reverse proxy and cPanel AutoSSL. No changes to the hosting server are in
 here. Redis must be isolated from other applications via credentials/key ACLs as appropriate.
 Do not expose this development milestone publicly without completing production controls.
 
-Next: MariaDB clients/channels/options with encrypted credentials; client and channel
-lifecycle management; HTTP API/webhook receiver; shared adapters for Bale, Rubika,
-Telegram, EitaaYar, Instagram and later WhatsApp. Each adapter uses the same routing
-contract; no per-bot files/processes and no permanent customer directory in the hub.
+## Database mode and channels (second development milestone)
+
+Create a MariaDB database and restricted database user first using cPanel. Set the
+HUB_DB_* variables in .env and generate a Fernet key with:
+
+    python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+
+Keep this key private and backed up separately from the database. Never commit .env.
+Database mode overrides static endpoints; existing demo placeholder values must be
+removed or set HUB_ENDPOINTS='{}' to avoid validation errors.
+
+    source .env
+    python -m support_hub.admin init-db
+    python -m support_hub.admin add-client shop1 admin --peer public
+    python -m support_hub.admin add-client shop1 public --peer admin
+    python -m support_hub.admin add-channel shop1 admin telegram
+    python -m support_hub
+
+Provisioning is local CLI only; no public management API yet. Client tokens are
+random and hashed. Channel credentials use Fernet authenticated encryption.
+Each channel has a virtual destination ch-<channel ID> authorized only for its owner.
+The HTTP server is on localhost:8766 and WebSocket on localhost:8765.
+For incoming provider callbacks proxy /webhook/ to 8766; do not log secret callback
+paths at Apache or any other proxy. /health can be checked locally.
+
+Register a real callback only after SSL and proxy are working:
+
+    python -m support_hub.admin set-webhook shop1 <channel-id> https://hub.example.com
+
+This changes the registered bot webhook, so use a dedicated test bot.
+Telegram verifies both secret path and provider secret header. Bale and Rubika
+use unique random secret paths. Their contracts must be tested with real bots.
+Eitaa is outbound text only using the application API; inbound not implemented.
+Instagram and WhatsApp are not implemented. No media transfer in this milestone.
+
+An incoming webhook returns success only after Redis accepts the normalized event.
+The owner replies with a message to ch-<channel ID>, payload:
+    {"type":"text","external_id":"123456","text":"hello"}
+
+Provider sends retry on temporary errors and honor HTTP 429 Retry-After when
+present. Permanent rejection is removed and reported via a best-effort delivery_status
+event; sent denotes provider acceptance, not customer read/delivery. A provider may
+receive a duplicate if its send succeeded but the Redis ACK failed. The sweep is
+single-process, bounded concurrency, and checks all active channels; load testing,
+rate limits, durable delivery receipts, idle connection revocation and scoped
+browser credentials remain required before public deployment. No permanent customer
+directory, bot-per-process model, or UI. Provider access from the hosting network
+must be verified separately.
+
+Disable using local commands:
+    python -m support_hub.admin disable-channel shop1 <channel-id>
+    python -m support_hub.admin disable-client shop1 admin
+
+Disabled channels stop being swept; their pending data expire normally. This does
+not unregister an upstream webhook. Disabled clients cannot send further frames;
+an already authenticated idle connection is not immediately revoked in this milestone.
+
