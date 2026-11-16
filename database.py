@@ -44,7 +44,7 @@ async def register_user(pool, name, email, phone, password, project_name,
                 await cursor.execute(
                     "INSERT INTO projects (user_id, name, domain, description, token) "
                     "VALUES (%s, %s, %s, %s, %s)",
-                    (user_id, project_name, domain, description, token.encode("ascii")),
+                    (user_id, project_name, domain, description, token),
                 )
             await conn.commit()
         except BaseException:
@@ -62,7 +62,7 @@ async def authenticate_project(pool, token):
         return None
     async with pool.acquire() as conn:
         async with conn.cursor() as cursor:
-            await cursor.execute("SELECT id FROM projects WHERE token = %s", (token.encode("utf-8"),))
+            await cursor.execute("SELECT id FROM projects WHERE token = %s", (token,))
             row = await cursor.fetchone()
             return row[0] if row else None
 
