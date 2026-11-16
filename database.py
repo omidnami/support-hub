@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 import os
+import secrets
 from pathlib import Path
 
 import aiomysql
@@ -15,6 +17,44 @@ async def open_database():
         charset="utf8mb4",
         autocommit=True,
     )
+
+
+def hash_password(password):
+    salt = secrets.token_hex(16)
+    iterations = 600_000
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), bytes.fromhex(salt), iterations
+    ).hex()
+    return f"pbkdf2_sha256${iterations}${salt}${digest}"
+
+
+async def register_user(pool, name, email, phone, password, project_name,
+                        domain=None, description=None):
+    token = secrets.token_hex(16)
+    password_hash = await asyncio.to_thread(hash_password, password)
+    async with pool.acquire() as conn:
+        await conn.begin()
+        try:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    "INSERT INTO users (name, email, phone, password) VALUES (%s, %s, %s, %s)",
+                    (name, email, phone, password_hash),
+                )
+                user_id = cursor.lastrowid
+                await cursor.execute(
+                    "INSERT INTO projects (user_id, name, domain, description, token) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (user_id, project_name, domain, description, token.encode("ascii")),
+                )
+            await conn.commit()
+        except BaseException:
+            try:
+                await conn.rollback()
+            except BaseException:
+                conn.close()
+                raise
+            raise
+    return token
 
 
 async def authenticate_project(pool, token):

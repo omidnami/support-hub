@@ -3,7 +3,7 @@ import os
 import socketio
 from aiohttp import web
 
-from database import authenticate_project, find_source_project, open_database
+from database import authenticate_project, find_source_project, open_database, register_user
 
 
 def create_app():
@@ -23,6 +23,42 @@ def create_app():
             await pool.wait_closed()
 
     app.cleanup_ctx.append(database_context)
+
+    async def register(request):
+        try:
+            data = await request.json()
+        except (ValueError, TypeError):
+            return web.json_response({"status": False, "message": "Invalid JSON."}, status=400)
+        if not isinstance(data, dict):
+            return web.json_response({"status": False, "message": "Invalid JSON."}, status=400)
+
+        values = {}
+        fields = {
+            "name": 190, "email": 254, "phone": 32, "password": 255,
+            "project_name": 190, "domain": 253, "description": 16383,
+        }
+        for key, limit in fields.items():
+            value = data.get(key)
+            optional = key in ("domain", "description")
+            if optional and value is None:
+                values[key] = None
+                continue
+            if not isinstance(value, str) or len(value) > limit:
+                return web.json_response(
+                    {"status": False, "message": f"Invalid field: {key}"}, status=422
+                )
+            if key != "password":
+                value = value.strip()
+            if not value.strip() and not optional:
+                return web.json_response(
+                    {"status": False, "message": f"Required field: {key}"}, status=422
+                )
+            values[key] = value if value or not optional else None
+
+        token = await register_user(pool, **values)
+        return web.json_response({"status": True, "token": token}, status=201)
+
+    app.router.add_post("/api/register", register)
 
     def room(project_id):
         return f"project:{project_id}"

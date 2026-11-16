@@ -10,9 +10,8 @@ sources. The project token identifies a socket connection. A source is looked
 up by its type (name) and robot_id, not by the sender of a message.
 
 Use a fresh MariaDB database for this new implementation. This migration does
-not drop or convert any previous tables. User and project records are currently
-created manually; there is no registration API in this step. Store password
-hashes in users.password, and use distinct random tokens in projects.token.
+not drop or convert any previous tables. Users and their first project can be created together through the registration API.
+Passwords are hashed; project tokens are stored in projects.token.
 
 ## Run
 
@@ -64,3 +63,32 @@ an async emit_source(name, robot_id, event, *args) function. It resolves the
 project from sources and emits only to that project's room. Unknown sources
 return False; this is not a delivery receipt. Offline connections do not
 receive missed events. No provider integration or server deployment is included.
+
+## Initial registration
+
+POST /api/register on the same HTTP server as Socket.IO.
+
+```json
+{
+  "name": "Test User",
+  "email": "user@example.ir",
+  "phone": "09121234567",
+  "password": "example-password",
+  "project_name": "My Shop",
+  "domain": "example.ir",
+  "description": "My first project"
+}
+```
+
+Only domain and description are optional. The user and first project are created
+in one database transaction. The response (HTTP 201) contains the generated
+project token:
+
+```json
+{"status": true, "token": "<32 hex characters>"}
+```
+
+Use this token directly in the existing Socket.IO auth object. No separate
+HTTP process, dependency or migration is required. This endpoint creates an
+initial user/project only; login, duplicate-account policy and additional
+project management are not part of this step.
