@@ -316,10 +316,12 @@ import { io } from "socket.io-client";
 
 const operator = io("http://127.0.0.1:8765", {
   transports: ["websocket"],
-  auth: { role: "operator", token: "PROJECT_TOKEN" },
+  auth: { token: "PROJECT_TOKEN" },
   autoConnect: false
 });
 operator.on("authenticated", ({ project_id }) => console.log(project_id));
+operator.on("connect", () => console.log(operator.connected)); // true
+operator.on("disconnect", () => console.log(operator.connected)); // false
 operator.on("chat", (message) => console.log(message));
 operator.on("chat_error", (error) => console.error(error.message));
 operator.on("connect_error", (error) => console.error(error.message));
@@ -332,7 +334,11 @@ operator.connect();
 {"role":"operator","project_id":1}
 ```
 
-توکن پروژه فقط هنگام احراز هویت اولیه اتصال ارسال می‌شود (و برای REST API طبق بخش ۲). اپراتور عضو اتاق اختصاصی پروژه است.
+توکن پروژه فقط در handshake هر اتصال بررسی می‌شود (و برای REST API طبق بخش ۲). سرور از جدول projects ستون id را می‌خواند و اتصال را در Session و Room داخلی Socket.IO در RAM قرار می‌دهد. رویداد authenticated فقط اطلاعات پروژه را برمی‌گرداند؛ وضعیت آنلاین/آفلاین از connect، disconnect و socket.connected تعیین می‌شود. در اتصال مجدد، احراز هویت دوباره انجام می‌شود.
+
+Heartbeat داخلی Engine.IO: سرور هر ۲۵ ثانیه ping می‌فرستد؛ مهلت pong کلاینت ۲۰ ثانیه است. Socket.IO قطع ارتباط و خروج از Room را خودکار مدیریت می‌کند. Ping/Pong اختصاصی لازم نیست. کلاینت استاندارد هنگام قطع موقت ارتباط خودکار تلاش به اتصال مجدد می‌کند. قبل از ارسال پیام، socket.connected را بررسی کنید.
+
+مراجع رسمی: [Python Socket.IO Server](https://python-socketio.readthedocs.io/en/stable/server.html) · [Socket.IO Client lifecycle](https://socket.io/docs/v4/client-socket-instance/) · [Heartbeat](https://socket.io/docs/v4/how-it-works/)
 
 ### ۴.۲. اتصال کلاینت چت
 
@@ -349,6 +355,8 @@ const client = io("http://127.0.0.1:8765", {
   autoConnect: false
 });
 client.on("authenticated", (identity) => console.log(identity));
+client.on("connect", () => console.log(client.connected));
+client.on("disconnect", () => console.log(client.connected));
 client.on("chat", (message) => console.log(message));
 client.on("chat_error", (error) => console.error(error.message));
 client.on("connect_error", (error) => console.error(error.message));
@@ -367,7 +375,7 @@ client.connect();
 
 ### ۴.۳. قالب واحد پیام
 
-هر دو سمت با رویداد `chat` یک شیء JSON شش‌فیلدی ارسال و دریافت می‌کنند.
+هر دو سمت با رویداد `chat` یک شیء JSON هفت‌فیلدی ارسال و دریافت می‌کنند.
 
 | فیلد | نوع | کاربرد |
 | --- | --- | --- |
@@ -377,8 +385,9 @@ client.connect();
 | file | null / string / object | مرجع فایل یا اطلاعات فایل؛ بدون ذخیره یا آپلود در Hub |
 | robot_id | string | شناسه منبع |
 | timestamp | integer | Unix timestamp بر حسب میلی‌ثانیه |
+| source | string | نام منبع مانند chat، bale یا telegram |
 
-شناسه‌ها می‌توانند به صورت integer نیز ارسال شوند و سرور آن‌ها را به string تبدیل می‌کند. هر شش فیلد ضروری است. نقش ارسال‌کننده و شناسه‌های کلاینت با Session اتصال تطبیق داده می‌شوند.
+شناسه‌ها می‌توانند به صورت integer نیز ارسال شوند و سرور آن‌ها را به string تبدیل می‌کند. هر هفت فیلد ضروری است. نقش ارسال‌کننده و شناسه‌های کلاینت با Session اتصال تطبیق داده می‌شوند.
 
 ارسال کلاینت، پس از اتصال معتبر:
 
@@ -389,7 +398,8 @@ client.emit("chat", {
   text: "Hello",
   file: null,
   robot_id: "my-shop-chat",
-  timestamp: Date.now()
+  timestamp: Date.now(),
+  source: "chat"
 });
 ```
 
@@ -402,16 +412,17 @@ operator.emit("chat", {
   text: "How can I help?",
   file: null,
   robot_id: "my-shop-chat",
-  timestamp: Date.now()
+  timestamp: Date.now(),
+  source: "chat"
 });
 ```
 
-پیام به تمام اپراتورهای همان پروژه و اتصال‌های همان گفتگو ارسال می‌شود (شامل فرستنده). کلاینت‌های دیگر و پروژه‌های دیگر پیام را دریافت نمی‌کنند. برای اپراتور، منبع فقط در محدوده پروژه احرازشده جستجو می‌شود. اگر robot_id در همان پروژه با چند نوع منبع مشترک باشد، ارسال اپراتور رد می‌شود، زیرا دیتابیس فعلی فقط ترکیب name و robot_id را یکتا می‌داند.
+پیام به تمام اپراتورهای همان پروژه و اتصال‌های همان گفتگو ارسال می‌شود (شامل فرستنده). کلاینت‌های دیگر و پروژه‌های دیگر پیام را دریافت نمی‌کنند. پروژه مقصد با ترکیب source (ستون sources.name) و robot_id پیدا می‌شود و sources.project_id باید با projects.id ثبت‌شده در Session اتصال مطابقت داشته باشد. یکتایی robot_id در هر منبع مستقل است.
 
 خطاهای پیام با `chat_error` فقط به فرستنده ارسال می‌شوند:
 
 ```json
-{"status":false,"message":"Source not found in project or robot_id is ambiguous."}
+{"status":false,"message":"Source not found in project."}
 ```
 
 در صورت استفاده از callback تأیید Socket.IO، نتیجه موفق `{"status":true}` به معنی مسیریابی است، نه تضمین دریافت نهایی. پیام‌ها ذخیره نمی‌شوند.
@@ -455,7 +466,7 @@ operator.emit("chat", {
 
 - سه جدول users، projects و sources.
 - عضویت اولیه، ویرایش کاربر و پروژه، ثبت/ویرایش توکن/حذف منبع.
-- اتصال اپراتور با توکن پروژه؛ اتصال کلاینت با robot_id منبع chat و user_id؛ مسیریابی پیام شش‌فیلدی به پروژه و گفتگوی مربوطه.
+- اتصال اپراتور با توکن پروژه؛ اتصال کلاینت با robot_id منبع chat و user_id؛ مسیریابی پیام هفت‌فیلدی به پروژه و گفتگوی مربوطه.
 - بدون Redis، صف، ذخیره تاریخچه پیام، اپراتور یا کلاینت در دیتابیس.
 - پیام‌های ارسال‌شده هنگام آفلاین بودن مقصد نگهداری نمی‌شوند.
 - ثبت منبع به معنی اتصال فعال به ربات نیست؛ Polling، Webhook و ارسال پیام به API پیام‌رسان‌ها در این نسخه وجود ندارند.

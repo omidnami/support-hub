@@ -78,18 +78,6 @@ async def find_source_project(pool, name, robot_id):
             return row[0] if row else None
 
 
-async def find_project_source(pool, project_id, robot_id):
-    """Resolve a robot ID within the authenticated project; reject ambiguity."""
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cursor:
-            await cursor.execute(
-                "SELECT name FROM sources WHERE project_id = %s AND robot_id = %s LIMIT 2",
-                (project_id, robot_id),
-            )
-            rows = await cursor.fetchall()
-            return rows[0][0] if len(rows) == 1 else None
-
-
 async def register_source(pool, project_id, name, robot_id, token):
     async with pool.acquire() as conn:
         async with conn.cursor() as cursor:

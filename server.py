@@ -10,7 +10,7 @@ import socketio
 from aiohttp import web
 
 from database import (
-    authenticate_project, find_source_project, find_project_source, open_database, register_user, register_source,
+    authenticate_project, find_source_project, open_database, register_user, register_source,
     update_user, update_project, get_source_name, update_source_token, delete_source,
 )
 
@@ -62,7 +62,10 @@ async def resolve_robot_id(name, token):
 
 def create_app():
     app = web.Application()
-    sio = socketio.AsyncServer(async_mode="aiohttp", transports=["websocket"])
+    sio = socketio.AsyncServer(
+        async_mode="aiohttp", transports=["websocket"],
+        ping_interval=25, ping_timeout=20,
+    )
     sio.attach(app)
 
     pool = None
@@ -296,9 +299,9 @@ def create_app():
     def room(project_id):
         return f"project:{project_id}"
 
-    def client_room(project_id, robot_id, user_id):
+    def client_room(project_id, source, robot_id, user_id):
         return "chat:" + json.dumps(
-            [project_id, robot_id, user_id], ensure_ascii=True, separators=(",", ":")
+            [project_id, source, robot_id, user_id], ensure_ascii=True, separators=(",", ":")
         )
 
     def normalize_id(value):
@@ -308,13 +311,15 @@ def create_app():
         return value if value.strip() and len(value) <= 255 else None
 
     def message_payload(data, sender):
-        fields = {"user_id", "sender", "text", "file", "robot_id", "timestamp"}
+        fields = {"user_id", "sender", "text", "file", "robot_id", "timestamp", "source"}
         if not isinstance(data, dict) or set(data) != fields:
-            raise ValueError("Expected user_id, sender, text, file, robot_id and timestamp.")
+            raise ValueError("Expected user_id, sender, text, file, robot_id, timestamp and source.")
         user_id = normalize_id(data["user_id"])
         robot_id = normalize_id(data["robot_id"])
         if user_id is None or robot_id is None:
             raise ValueError("Invalid user_id or robot_id.")
+        if data["source"] not in SOURCE_NAMES:
+            raise ValueError("Invalid source.")
         if data["sender"] != sender:
             raise ValueError("Sender does not match the connection.")
         if not isinstance(data["text"], str):
@@ -339,7 +344,7 @@ def create_app():
             payload = message_payload(args[0], "client")
         except ValueError:
             return False
-        if payload["robot_id"] != normalize_id(robot_id):
+        if payload["source"] != name or payload["robot_id"] != normalize_id(robot_id):
             return False
         project_id = await find_source_project(pool, name, payload["robot_id"])
         if project_id is None:
@@ -370,9 +375,9 @@ def create_app():
                 return False
             await sio.save_session(sid, {
                 "role": role, "project_id": project_id,
-                "robot_id": robot_id, "user_id": user_id,
+                "source": "chat", "robot_id": robot_id, "user_id": user_id,
             })
-            await sio.enter_room(sid, client_room(project_id, robot_id, user_id))
+            await sio.enter_room(sid, client_room(project_id, "chat", robot_id, user_id))
             await sio.emit("authenticated", {
                 "role": role, "robot_id": robot_id, "user_id": user_id,
             }, to=sid)
@@ -397,23 +402,22 @@ def create_app():
             payload = message_payload(args[0], role)
         except ValueError as exc:
             return await chat_failure(sid, str(exc))
-        robot_id, user_id = payload["robot_id"], payload["user_id"]
-        if role == "client":
-            if robot_id != session["robot_id"] or user_id != session["user_id"]:
-                return await chat_failure(sid, "Message does not match the connected client.")
-            # Recheck the source in case it was removed or its ID changed.
-            if await find_source_project(pool, "chat", robot_id) != project_id:
-                return await chat_failure(sid, "Chat source is no longer available.")
-        else:
-            name = await find_project_source(pool, project_id, robot_id)
-            if name is None:
-                return await chat_failure(sid, "Source not found in project or robot_id is ambiguous.")
-            if name != "chat":
-                return await chat_failure(sid, "Provider messaging is not implemented yet.")
+        source, robot_id, user_id = payload["source"], payload["robot_id"], payload["user_id"]
+        if role == "client" and (
+            source != session["source"] or robot_id != session["robot_id"]
+            or user_id != session["user_id"]
+        ):
+            return await chat_failure(sid, "Message does not match the connected client.")
+
+        # The source identifies the project, but cannot override the session.
+        if await find_source_project(pool, source, robot_id) != project_id:
+            return await chat_failure(sid, "Source not found in project.")
+        if source != "chat":
+            return await chat_failure(sid, "Provider messaging is not implemented yet.")
 
         # Echo to the project's operators and the target conversation only.
         await emit_project(project_id, "chat", payload)
-        await sio.emit("chat", payload, room=client_room(project_id, robot_id, user_id))
+        await sio.emit("chat", payload, room=client_room(project_id, source, robot_id, user_id))
         return {"status": True}
 
     # Socket.IO automatically removes disconnected sockets from their rooms.
