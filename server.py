@@ -1,4 +1,5 @@
 import os
+import json
 from urllib.parse import quote
 
 import asyncio
@@ -9,7 +10,7 @@ import socketio
 from aiohttp import web
 
 from database import (
-    authenticate_project, find_source_project, open_database, register_user, register_source,
+    authenticate_project, find_source_project, find_project_source, open_database, register_user, register_source,
     update_user, update_project, get_source_name, update_source_token, delete_source,
 )
 
@@ -295,34 +296,125 @@ def create_app():
     def room(project_id):
         return f"project:{project_id}"
 
+    def client_room(project_id, robot_id, user_id):
+        return "chat:" + json.dumps(
+            [project_id, robot_id, user_id], ensure_ascii=True, separators=(",", ":")
+        )
+
+    def normalize_id(value):
+        if type(value) not in (str, int):
+            return None
+        value = str(value)
+        return value if value.strip() and len(value) <= 255 else None
+
+    def message_payload(data, sender):
+        fields = {"user_id", "sender", "text", "file", "robot_id", "timestamp"}
+        if not isinstance(data, dict) or set(data) != fields:
+            raise ValueError("Expected user_id, sender, text, file, robot_id and timestamp.")
+        user_id = normalize_id(data["user_id"])
+        robot_id = normalize_id(data["robot_id"])
+        if user_id is None or robot_id is None:
+            raise ValueError("Invalid user_id or robot_id.")
+        if data["sender"] != sender:
+            raise ValueError("Sender does not match the connection.")
+        if not isinstance(data["text"], str):
+            raise ValueError("Text must be a string.")
+        if data["file"] is not None and not isinstance(data["file"], (str, dict)):
+            raise ValueError("File must be null, a string or a JSON object.")
+        if type(data["timestamp"]) is not int or not 0 <= data["timestamp"] <= 9007199254740991:
+            raise ValueError("Timestamp must be Unix milliseconds.")
+        if not data["text"].strip() and not data["file"]:
+            raise ValueError("Message is empty.")
+        return {**data, "user_id": user_id, "robot_id": robot_id, "sender": sender}
+
     async def emit_project(project_id, event, *args):
+        # Only authenticated operators belong to the project room.
         await sio.emit(event, args, room=room(project_id))
 
     async def emit_source(name, robot_id, event, *args):
-        project_id = await find_source_project(pool, name, robot_id)
+        # Entry point for future provider adapters, not a public endpoint.
+        if name not in SOURCE_NAMES or event != "chat" or len(args) != 1:
+            return False
+        try:
+            payload = message_payload(args[0], "client")
+        except ValueError:
+            return False
+        if payload["robot_id"] != normalize_id(robot_id):
+            return False
+        project_id = await find_source_project(pool, name, payload["robot_id"])
         if project_id is None:
             return False
-        await emit_project(project_id, event, *args)
+        await emit_project(project_id, "chat", payload)
         return True
 
     @sio.event
     async def connect(sid, environ, auth):
-        token = auth.get("token") if isinstance(auth, dict) else None
-        project_id = await authenticate_project(pool, token)
-        if project_id is None:
+        if not isinstance(auth, dict):
             return False
-        await sio.save_session(sid, {"project_id": project_id})
-        await sio.enter_room(sid, room(project_id))
-        await sio.emit("authenticated", {"project_id": project_id}, to=sid)
+        role = auth.get("role", "operator" if "token" in auth else None)
+        if role == "operator":
+            project_id = await authenticate_project(pool, auth.get("token"))
+            if project_id is None:
+                return False
+            await sio.save_session(sid, {"role": role, "project_id": project_id})
+            await sio.enter_room(sid, room(project_id))
+            await sio.emit("authenticated", {"role": role, "project_id": project_id}, to=sid)
+        elif role == "client":
+            robot_id = normalize_id(auth.get("robot_id"))
+            user_id = normalize_id(auth.get("user_id"))
+            if robot_id is None or user_id is None:
+                return False
+            # Browser clients can use only registered chat sources, never bot tokens.
+            project_id = await find_source_project(pool, "chat", robot_id)
+            if project_id is None:
+                return False
+            await sio.save_session(sid, {
+                "role": role, "project_id": project_id,
+                "robot_id": robot_id, "user_id": user_id,
+            })
+            await sio.enter_room(sid, client_room(project_id, robot_id, user_id))
+            await sio.emit("authenticated", {
+                "role": role, "robot_id": robot_id, "user_id": user_id,
+            }, to=sid)
+        else:
+            return False
 
-    @sio.on("*")
-    async def relay(event, sid, *args):
-        if event == "authenticated":
-            return
+    async def chat_failure(sid, message):
+        result = {"status": False, "message": message}
+        await sio.emit("chat_error", result, to=sid)
+        return result
+
+    @sio.on("chat")
+    async def chat(sid, *args):
         session = await sio.get_session(sid)
+        role = session.get("role")
         project_id = session.get("project_id")
-        if project_id is not None:
-            await emit_project(project_id, event, *args)
+        if role not in ("operator", "client") or project_id is None:
+            return await chat_failure(sid, "Not authenticated.")
+        if len(args) != 1:
+            return await chat_failure(sid, "Expected one message object.")
+        try:
+            payload = message_payload(args[0], role)
+        except ValueError as exc:
+            return await chat_failure(sid, str(exc))
+        robot_id, user_id = payload["robot_id"], payload["user_id"]
+        if role == "client":
+            if robot_id != session["robot_id"] or user_id != session["user_id"]:
+                return await chat_failure(sid, "Message does not match the connected client.")
+            # Recheck the source in case it was removed or its ID changed.
+            if await find_source_project(pool, "chat", robot_id) != project_id:
+                return await chat_failure(sid, "Chat source is no longer available.")
+        else:
+            name = await find_project_source(pool, project_id, robot_id)
+            if name is None:
+                return await chat_failure(sid, "Source not found in project or robot_id is ambiguous.")
+            if name != "chat":
+                return await chat_failure(sid, "Provider messaging is not implemented yet.")
+
+        # Echo to the project's operators and the target conversation only.
+        await emit_project(project_id, "chat", payload)
+        await sio.emit("chat", payload, room=client_room(project_id, robot_id, user_id))
+        return {"status": True}
 
     # Socket.IO automatically removes disconnected sockets from their rooms.
     return app, sio, emit_source

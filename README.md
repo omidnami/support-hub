@@ -62,7 +62,7 @@ http://127.0.0.1:8765
 <a id="authentication"></a>
 ## ۲. احراز هویت
 
-هویت اتصال، **پروژه** است. پس از عضویت اولیه، توکن پروژه را دریافت و در نرم‌افزار خود نگهداری کنید.
+هویت اتصال اپراتور، **پروژه** است. کلاینت چت با شناسه منبع و شناسه کاربر متصل می‌شود. پس از عضویت اولیه، توکن پروژه را دریافت و فقط در بخش مدیریتی نگهداری کنید.
 
 برای تمام APIها به‌جز عضویت اولیه:
 
@@ -75,7 +75,7 @@ Content-Type: application/json
 
 | توکن | کاربرد |
 | --- | --- |
-| Project token | احراز هویت REST API و Socket.IO |
+| Project token | احراز هویت REST API و Socket.IO اپراتور |
 | Source token | شناسایی و اتصال به سرویس منبع، مانند ربات بله |
 
 توکن پروژه در هدر و توکن منبع در بدنه درخواست ارسال می‌شود. توکن پروژه به مالکیت همان پروژه محدود است؛ API ویرایش کاربر نیز مالک همان پروژه را ویرایش می‌کند.
@@ -299,100 +299,128 @@ curl -X DELETE 'http://127.0.0.1:8765/api/sources/12' \
 <a id="socket"></a>
 ## ۴. اتصال Socket.IO
 
-از کلاینت سازگار با Socket.IO v4 استفاده کنید. اتصال WebSocket خام سازگار نیست.
+از Socket.IO v4 با WebSocket transport استفاده کنید. WebSocket بومی نیز در صورت پیاده‌سازی فریم‌های Engine.IO v4 و Socket.IO قابل استفاده است.
 
 | مشخصه | مقدار |
 | --- | --- |
 | آدرس نمونه | `http://127.0.0.1:8765` |
 | Path | `/socket.io/` |
 | Transport | websocket |
-| Auth | `{"token":"PROJECT_TOKEN"}` |
-| اتاق داخلی | `project:{project_id}` |
+| رویداد پیام | chat |
+| رویداد خطا | chat_error |
 
-### ۴.۱. اتصال و دریافت شناسه پروژه
-
-نمونه JavaScript با پکیج `socket.io-client`:
+### ۴.۱. اتصال اپراتور
 
 ```javascript
 import { io } from "socket.io-client";
 
-const socket = io("http://127.0.0.1:8765", {
-  path: "/socket.io/",
+const operator = io("http://127.0.0.1:8765", {
   transports: ["websocket"],
-  auth: { token: "PROJECT_TOKEN" },
+  auth: { role: "operator", token: "PROJECT_TOKEN" },
   autoConnect: false
 });
-
-socket.on("authenticated", ({ project_id }) => {
-  console.log("Project ID:", project_id);
-});
-
-socket.on("connect", () => {
-  console.log("Connected");
-});
-
-socket.on("connect_error", (error) => {
-  console.log("Connection rejected:", error.message);
-});
-
-socket.on("disconnect", (reason) => {
-  console.log("Disconnected:", reason);
-});
-
-socket.on("chat", (data) => {
-  console.log("Received:", data);
-});
-
-socket.connect();
+operator.on("authenticated", ({ project_id }) => console.log(project_id));
+operator.on("chat", (message) => console.log(message));
+operator.on("chat_error", (error) => console.error(error.message));
+operator.on("connect_error", (error) => console.error(error.message));
+operator.connect();
 ```
 
-پس از اعتبارسنجی توکن، سرور اتصال را به اتاق پروژه اضافه کرده و رویداد زیر را فقط به همان اتصال ارسال می‌کند:
+پاسخ رویداد `authenticated`:
 
 ```json
-{"project_id": 1}
+{"role":"operator","project_id":1}
 ```
 
-نام رویداد: `authenticated`. در صورت نامعتبر بودن توکن، اتصال Socket.IO رد می‌شود.
+توکن پروژه فقط هنگام احراز هویت اولیه اتصال ارسال می‌شود (و برای REST API طبق بخش ۲). اپراتور عضو اتاق اختصاصی پروژه است.
 
-نمونه مرورگر باید با سیاست Origin پیش‌فرض Socket.IO سازگار باشد (معمولاً همان Origin سرویس). در نسخه فعلی CORS برای اتصال از دامنه‌های دیگر تنظیم نشده است. توکن پروژه را در کد عمومی سایت قرار ندهید.
+### ۴.۲. اتصال کلاینت چت
 
-### ۴.۲. ارسال و دریافت داده
-
-پس از اتصال موفق:
+ابتدا مالک پروژه یک منبع chat از طریق REST API ثبت می‌کند (بخش ۳.۴)، مثلاً با توکن `my-shop-chat` که robot_id آن نیز همین مقدار خواهد بود.
 
 ```javascript
-socket.emit("chat", {
+const client = io("http://127.0.0.1:8765", {
+  transports: ["websocket"],
+  auth: {
+    role: "client",
+    robot_id: "my-shop-chat",
+    user_id: "customer-101"
+  },
+  autoConnect: false
+});
+client.on("authenticated", (identity) => console.log(identity));
+client.on("chat", (message) => console.log(message));
+client.on("chat_error", (error) => console.error(error.message));
+client.on("connect_error", (error) => console.error(error.message));
+client.connect();
+```
+
+پاسخ رویداد `authenticated`:
+
+```json
+{"role":"client","robot_id":"my-shop-chat","user_id":"customer-101"}
+```
+
+توکن پروژه یا توکن ربات پیام‌رسان در اختیار کلاینت قرار نمی‌گیرد. سرور منبع chat را در دیتابیس پیدا می‌کند و اتصال را به گفتگوی همان شناسه کاربر و منبع در پروژه مرتبط محدود می‌کند.
+
+**محدودیت احراز هویت کلاینت:** شناسه کاربر توسط برنامه متصل تعیین می‌شود؛ این نسخه مالکیت آن را مستقلاً اعتبارسنجی نمی‌کند. برای تست محلی مناسب است، اما برای چت عمومی واقعی، دانستن robot_id و user_id نباید به تنهایی اجازه ورود به گفتگوی شخص دیگری بدهد. چگونگی احراز هویت کلاینت قبل از استقرار عمومی باید تعیین شود.
+
+### ۴.۳. قالب واحد پیام
+
+هر دو سمت با رویداد `chat` یک شیء JSON شش‌فیلدی ارسال و دریافت می‌کنند.
+
+| فیلد | نوع | کاربرد |
+| --- | --- | --- |
+| user_id | string | شناسه کاربر/مشتری گفتگو، در هر دو جهت |
+| sender | string | client یا operator |
+| text | string | متن؛ در پیام صرفاً فایلی می‌تواند خالی باشد |
+| file | null / string / object | مرجع فایل یا اطلاعات فایل؛ بدون ذخیره یا آپلود در Hub |
+| robot_id | string | شناسه منبع |
+| timestamp | integer | Unix timestamp بر حسب میلی‌ثانیه |
+
+شناسه‌ها می‌توانند به صورت integer نیز ارسال شوند و سرور آن‌ها را به string تبدیل می‌کند. هر شش فیلد ضروری است. نقش ارسال‌کننده و شناسه‌های کلاینت با Session اتصال تطبیق داده می‌شوند.
+
+ارسال کلاینت، پس از اتصال معتبر:
+
+```javascript
+client.emit("chat", {
+  user_id: "customer-101",
+  sender: "client",
   text: "Hello",
-  sender_id: "123456"
+  file: null,
+  robot_id: "my-shop-chat",
+  timestamp: Date.now()
 });
 ```
 
-دریافت:
+ارسال پاسخ اپراتور:
 
 ```javascript
-socket.on("chat", (data) => {
-  console.log(data);
+operator.emit("chat", {
+  user_id: "customer-101",
+  sender: "operator",
+  text: "How can I help?",
+  file: null,
+  robot_id: "my-shop-chat",
+  timestamp: Date.now()
 });
 ```
 
-`chat` صرفاً یک نام رویداد نمونه است. سرور رویدادهای سفارشی و داده همراهشان را به تمام اتصال‌های فعال همان پروژه، شامل فرستنده، منتقل می‌کند. تعیین ساختار داده بر عهده برنامه متصل است.
+پیام به تمام اپراتورهای همان پروژه و اتصال‌های همان گفتگو ارسال می‌شود (شامل فرستنده). کلاینت‌های دیگر و پروژه‌های دیگر پیام را دریافت نمی‌کنند. برای اپراتور، منبع فقط در محدوده پروژه احرازشده جستجو می‌شود. اگر robot_id در همان پروژه با چند نوع منبع مشترک باشد، ارسال اپراتور رد می‌شود، زیرا دیتابیس فعلی فقط ترکیب name و robot_id را یکتا می‌داند.
 
-سرور اتاق مقصد رویداد را از هویت احرازشده تعیین می‌کند، نه از `project_id` داخل داده ارسالی. رویداد `authenticated` برای سرور رزرو شده است.
+خطاهای پیام با `chat_error` فقط به فرستنده ارسال می‌شوند:
 
-### ۴.۳. مسیریابی داده‌های منابع (داخل سرور)
-
-تابع داخلی زیر از طریق مقدار بازگشتی `create_app()` قابل دسترسی است:
-
-```python
-app, sio, emit_source = create_app()
-
-# پس از راه‌اندازی app و دیتابیس، داخل همان سرویس:
-await emit_source("bale", "123456", "chat", {"text": "Hello"})
+```json
+{"status":false,"message":"Source not found in project or robot_id is ambiguous."}
 ```
 
-نگاشت منبع به پروژه از جدول `sources` و ترکیب `name + robot_id` انجام می‌شود. داده فقط به اتاق پروژه مرتبط ارسال می‌شود. اگر منبع پیدا نشود، تابع `False` برمی‌گرداند. نتیجه `True` به معنی مسیریابی رویداد است، نه تضمین دریافت توسط مقصد.
+در صورت استفاده از callback تأیید Socket.IO، نتیجه موفق `{"status":true}` به معنی مسیریابی است، نه تضمین دریافت نهایی. پیام‌ها ذخیره نمی‌شوند.
 
-این تابع یک REST API عمومی نیست. اتصال واقعی پیام‌رسان‌ها (دریافت پیام و ارسال پاسخ) هنوز ایجاد نشده است.
+### ۴.۴. پیام‌رسان‌ها و منابع دیگر
+
+تابع داخلی `emit_source(name, robot_id, "chat", payload)` برای آداپترهای آینده باقی مانده است. این تابع قالب پیام را کنترل می‌کند و از ترکیب name و robot_id پروژه را پیدا می‌کند تا پیام به اپراتورهای همان پروژه برسد. تابع API عمومی نیست. ارسال پاسخ اپراتور به منابع غیر chat فعلاً با خطا رد می‌شود تا آداپتر آن پیام‌رسان پیاده‌سازی شود. توکن ربات فقط برای API پلتفرم به کار می‌رود.
+
+نمونه‌های مرورگر باید از همان Origin سرور اجرا شوند؛ CORS دامنه‌های دیگر هنوز تنظیم نشده است.
 
 <a id="status-codes"></a>
 ## ۵. کدهای وضعیت HTTP
@@ -427,7 +455,7 @@ await emit_source("bale", "123456", "chat", {"text": "Hello"})
 
 - سه جدول users، projects و sources.
 - عضویت اولیه، ویرایش کاربر و پروژه، ثبت/ویرایش توکن/حذف منبع.
-- احراز هویت اتصال با توکن پروژه و Broadcast محدود به پروژه.
+- اتصال اپراتور با توکن پروژه؛ اتصال کلاینت با robot_id منبع chat و user_id؛ مسیریابی پیام شش‌فیلدی به پروژه و گفتگوی مربوطه.
 - بدون Redis، صف، ذخیره تاریخچه پیام، اپراتور یا کلاینت در دیتابیس.
 - پیام‌های ارسال‌شده هنگام آفلاین بودن مقصد نگهداری نمی‌شوند.
 - ثبت منبع به معنی اتصال فعال به ربات نیست؛ Polling، Webhook و ارسال پیام به API پیام‌رسان‌ها در این نسخه وجود ندارند.
