@@ -1,9 +1,0 @@
-# Redis 6.2 / 7 least-privilege ACL example (not a Redis configuration file).
-# Create a NEW unique user only; do not reset an existing shared user.
-# Replace the password with a locally generated random secret.
-# Match the key pattern to HUB_REDIS_PREFIX.
-# SELECT is restricted to DB 1 using Redis 6.2-compatible first-argument ACL.
-# CLIENT SETINFO is optional Redis client metadata; the client tolerates older servers.
-ACL SETUSER supporthub on >REPLACE_RANDOM_HEX_PASSWORD ~support-hub:* resetchannels -@all +ping +select|1 +get +set +expire +del +zremrangebyscore +zcard +zadd +zrem +zrange +eval
-# No FLUSHDB, FLUSHALL, CONFIG, ACL, KEYS, SCAN, or access to other key prefixes.
-# Persist explicitly after checking existing aclfile policy; see cpanel.md.

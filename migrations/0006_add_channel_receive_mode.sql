@@ -1,1 +1,0 @@
-ALTER TABLE channels ADD COLUMN IF NOT EXISTS receive_mode VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'webhook';
