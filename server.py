@@ -62,10 +62,7 @@ async def resolve_robot_id(name, token):
 
 def create_app():
     app = web.Application()
-    sio = socketio.AsyncServer(
-        async_mode="aiohttp", transports=["websocket"],
-        ping_interval=20, ping_timeout=20,
-    )
+    sio = socketio.AsyncServer(async_mode="aiohttp", transports=["websocket"])
     sio.attach(app)
 
     pool = None
