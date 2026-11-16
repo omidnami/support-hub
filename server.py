@@ -8,7 +8,10 @@ from pymysql.err import IntegrityError
 import socketio
 from aiohttp import web
 
-from database import authenticate_project, find_source_project, open_database, register_user, register_source
+from database import (
+    authenticate_project, find_source_project, open_database, register_user, register_source,
+    update_user, update_project, get_source_name, update_source_token, delete_source,
+)
 
 
 SOURCE_NAMES = ("rubika", "bale", "telegram", "whatsapp", "instagram", "eitaa", "chat")
@@ -159,6 +162,135 @@ def create_app():
         }, status=201)
 
     app.router.add_post("/api/sources", add_source)
+
+    def failure(message, status):
+        return web.json_response({"status": False, "message": message}, status=status)
+
+    async def request_project(request):
+        header = request.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            return None
+        return await authenticate_project(pool, header[7:])
+
+    async def patch_values(request, fields, nullable=()):
+        try:
+            data = await request.json()
+        except (ValueError, TypeError):
+            raise ValueError("Invalid JSON.") from None
+        if not isinstance(data, dict) or not data:
+            raise ValueError("Provide at least one field.")
+        values = {}
+        for key, value in data.items():
+            if key not in fields:
+                raise ValueError(f"Invalid field: {key}")
+            if value is None and key in nullable:
+                values[key] = None
+                continue
+            if not isinstance(value, str) or len(value) > fields[key]:
+                raise ValueError(f"Invalid field: {key}")
+            if key != "password":
+                value = value.strip()
+            if not value.strip() and key not in nullable:
+                raise ValueError(f"Required field: {key}")
+            values[key] = value if value or key not in nullable else None
+        return values
+
+    def path_id(request, key):
+        value = request.match_info[key]
+        if not value.isascii() or not value.isdecimal() or len(value) > 20:
+            return None
+        number = int(value)
+        return number if 0 < number <= 18446744073709551615 else None
+
+    async def edit_user(request):
+        project_id = await request_project(request)
+        if project_id is None:
+            return failure("Invalid project token.", 401)
+        try:
+            values = await patch_values(request, {
+                "name": 190, "email": 254, "phone": 32, "password": 255,
+            })
+        except ValueError as exc:
+            return failure(str(exc), 422)
+        await update_user(pool, project_id, values)
+        return web.json_response({"status": True})
+
+    async def edit_project(request):
+        project_id = await request_project(request)
+        if project_id is None:
+            return failure("Invalid project token.", 401)
+        target = path_id(request, "project_id")
+        if target is None:
+            return failure("Invalid project_id.", 422)
+        if target != project_id:
+            return failure("Project does not match token.", 403)
+        try:
+            values = await patch_values(request, {
+                "name": 190, "domain": 253, "description": 16383,
+            }, nullable=("domain", "description"))
+        except ValueError as exc:
+            return failure(str(exc), 422)
+        await update_project(pool, project_id, values)
+        return web.json_response({"status": True})
+
+    async def edit_source(request):
+        project_id = await request_project(request)
+        if project_id is None:
+            return failure("Invalid project token.", 401)
+        source_id = path_id(request, "source_id")
+        if source_id is None:
+            return failure("Invalid source_id.", 422)
+        name = await get_source_name(pool, project_id, source_id)
+        if name is None:
+            return failure("Source not found.", 404)
+        try:
+            # Token must be revalidated without silently trimming it.
+            data = await request.json()
+        except (ValueError, TypeError):
+            return failure("Invalid JSON.", 400)
+        if not isinstance(data, dict) or set(data) != {"token"}:
+            return failure("Provide the source token.", 422)
+        token = data["token"]
+        if (not isinstance(token, str) or not token
+                or len(token) > (255 if name == "chat" else 4096)
+                or any(ord(c) < 33 or ord(c) > 126 for c in token)):
+            return failure("Invalid source token.", 422)
+        if name == "whatsapp":
+            return failure("WhatsApp requires a verified phone number ID; registration not implemented.", 501)
+        try:
+            robot_id = await resolve_robot_id(name, token)
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError):
+            return failure("Platform API unavailable.", 502)
+        except ValueError:
+            return failure("Platform did not validate the source.", 422)
+        try:
+            updated = await update_source_token(pool, project_id, source_id, robot_id, token)
+        except IntegrityError as exc:
+            if exc.args and exc.args[0] == 1062:
+                return failure("Source already registered.", 409)
+            raise
+        if not updated:
+            return failure("Source not found.", 404)
+        return web.json_response({
+            "status": True, "id": source_id, "name": name,
+            "robot_id": robot_id, "project_id": project_id,
+        })
+
+    async def remove_source(request):
+        project_id = await request_project(request)
+        if project_id is None:
+            return failure("Invalid project token.", 401)
+        source_id = path_id(request, "source_id")
+        if source_id is None:
+            return failure("Invalid source_id.", 422)
+        if not await delete_source(pool, project_id, source_id):
+            return failure("Source not found.", 404)
+        return web.json_response({"status": True})
+
+    app.router.add_patch("/api/users/me", edit_user)
+    app.router.add_patch("/api/projects/{project_id}", edit_project)
+    app.router.add_patch("/api/sources/{source_id}", edit_source)
+    app.router.add_delete("/api/sources/{source_id}", remove_source)
 
     def room(project_id):
         return f"project:{project_id}"

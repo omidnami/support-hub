@@ -120,3 +120,30 @@ ENUM but returns 501 until its phone-number-ID registration flow is defined.
 
 Registration only; it does not start polling, register a webhook or change the
 Socket.IO relay. Live provider validation has not yet been tested.
+
+## Update and delete
+
+All four endpoints below require the existing header:
+
+Authorization: Bearer <project token>
+
+- PATCH /api/users/me — any subset of name, email, phone, password. The
+  account is the owner of the authenticated project; a project token is
+  trusted to edit that owner. Password is hashed again when provided.
+- PATCH /api/projects/{project_id} — any subset of name, domain, description.
+  The ID must match the token. Domain and description can be null. Ownership
+  and project token are unchanged.
+- PATCH /api/sources/{source_id} — body {"token":"<new source token>"}.
+  The ID is the local sources.id, not robot_id. The source must belong to
+  the authenticated project. The platform is determined by its existing name.
+  The server resolves the new robot ID before updating both fields in one
+  SQL statement. Failed validation or duplicate IDs leave the old record
+  unchanged. For chat, robot_id is the new token, without an external request.
+  WhatsApp is not implemented.
+- DELETE /api/sources/{source_id} — deletes only a source belonging to the
+  authenticated project. No request body is needed.
+
+Successful user/project changes and source deletion return {"status":true}.
+Source token updates return the same fields as source registration, with the
+updated robot_id and without a separate token field. No user or project deletion,
+project-token rotation, provider webhook changes or polling are included.

@@ -88,6 +88,68 @@ async def register_source(pool, project_id, name, robot_id, token):
             return cursor.lastrowid
 
 
+async def update_user(pool, project_id, values):
+    values = {key: values[key] for key in ("name", "email", "phone", "password") if key in values}
+    if "password" in values:
+        values["password"] = await asyncio.to_thread(hash_password, values["password"])
+    assignments = ", ".join(f"u.{key} = %s" for key in values)
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"UPDATE users u JOIN projects p ON p.user_id = u.id SET {assignments} WHERE p.id = %s",
+                (*values.values(), project_id),
+            )
+
+
+async def update_project(pool, project_id, values):
+    values = {key: values[key] for key in ("name", "domain", "description") if key in values}
+    assignments = ", ".join(f"{key} = %s" for key in values)
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"UPDATE projects SET {assignments} WHERE id = %s",
+                (*values.values(), project_id),
+            )
+
+
+async def get_source_name(pool, project_id, source_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT name FROM sources WHERE id = %s AND project_id = %s",
+                (source_id, project_id),
+            )
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+
+async def update_source_token(pool, project_id, source_id, robot_id, token):
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE sources SET token = %s, robot_id = %s WHERE id = %s AND project_id = %s",
+                (token, robot_id, source_id, project_id),
+            )
+            if cursor.rowcount:
+                return True
+            # An unchanged token and robot ID are also a successful update.
+            await cursor.execute(
+                "SELECT id FROM sources WHERE id = %s AND project_id = %s",
+                (source_id, project_id),
+            )
+            return (await cursor.fetchone()) is not None
+
+
+async def delete_source(pool, project_id, source_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "DELETE FROM sources WHERE id = %s AND project_id = %s",
+                (source_id, project_id),
+            )
+            return bool(cursor.rowcount)
+
+
 async def migrate():
     pool = await open_database()
     try:
