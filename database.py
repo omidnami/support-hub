@@ -78,15 +78,25 @@ async def find_source_project(pool, name, robot_id):
             return row[0] if row else None
 
 
+async def register_source(pool, project_id, name, robot_id, token):
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "INSERT INTO sources (project_id, name, robot_id, token) VALUES (%s, %s, %s, %s)",
+                (project_id, name, robot_id, token),
+            )
+            return cursor.lastrowid
+
+
 async def migrate():
     pool = await open_database()
     try:
-        sql = (Path(__file__).parent / "migrations" / "001_initial.sql").read_text(encoding="utf-8")
         async with pool.acquire() as conn:
             async with conn.cursor() as cursor:
-                for statement in sql.split(";"):
-                    if statement.strip():
-                        await cursor.execute(statement)
+                for path in sorted((Path(__file__).parent / "migrations").glob("*.sql")):
+                    for statement in path.read_text(encoding="utf-8").split(";"):
+                        if statement.strip():
+                            await cursor.execute(statement)
     finally:
         pool.close()
         await pool.wait_closed()

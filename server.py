@@ -1,9 +1,59 @@
 import os
+from urllib.parse import quote
+
+import asyncio
+import aiohttp
+from pymysql.err import IntegrityError
 
 import socketio
 from aiohttp import web
 
-from database import authenticate_project, find_source_project, open_database, register_user
+from database import authenticate_project, find_source_project, open_database, register_user, register_source
+
+
+SOURCE_NAMES = ("rubika", "bale", "telegram", "whatsapp", "instagram", "eitaa", "chat")
+
+
+async def resolve_robot_id(name, token):
+    if name == "chat":
+        return token
+    encoded = quote(token, safe=":")
+    urls = {
+        "bale": f"https://tapi.bale.ai/bot{encoded}/getMe",
+        "telegram": f"https://api.telegram.org/bot{encoded}/getMe",
+        "rubika": f"https://botapi.rubika.ir/v3/{encoded}/getMe",
+        "eitaa": f"https://eitaayar.ir/api/{encoded}/getMe",
+        "instagram": "https://graph.instagram.com/me",
+    }
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as http:
+        if name == "instagram":
+            response = await http.get(urls[name], params={"fields": "user_id"},
+                                      headers={"Authorization": f"Bearer {token}"},
+                                      allow_redirects=False)
+        else:
+            response = await http.post(urls[name], allow_redirects=False)
+        async with response:
+            if response.status >= 500 or response.status == 429:
+                raise RuntimeError("Platform API unavailable.")
+            if response.status != 200:
+                raise ValueError("Platform rejected the source token.")
+            data = await response.json(content_type=None)
+    if not isinstance(data, dict):
+        raise ValueError("Invalid platform response.")
+    if name == "instagram":
+        robot_id = data.get("user_id") if "error" not in data else None
+    elif name == "rubika":
+        result = data.get("data")
+        if data.get("status") != "OK" or not isinstance(result, dict):
+            raise ValueError("Platform rejected the source token.")
+        bot = result.get("bot", result)
+        robot_id = bot.get("bot_id") if isinstance(bot, dict) else None
+    else:
+        result = data.get("result")
+        robot_id = result.get("id") if data.get("ok") is True and isinstance(result, dict) else None
+    if type(robot_id) not in (int, str) or not str(robot_id).strip() or len(str(robot_id)) > 255:
+        raise ValueError("Platform did not return a valid source ID.")
+    return str(robot_id)
 
 
 def create_app():
@@ -59,6 +109,56 @@ def create_app():
         return web.json_response({"status": True, "token": token}, status=201)
 
     app.router.add_post("/api/register", register)
+
+    async def add_source(request):
+        def failure(message, status):
+            return web.json_response({"status": False, "message": message}, status=status)
+
+        header = request.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            return failure("Project token required.", 401)
+        project_id = await authenticate_project(pool, header[7:])
+        if project_id is None:
+            return failure("Invalid project token.", 401)
+        try:
+            data = await request.json()
+        except (ValueError, TypeError):
+            return failure("Invalid JSON.", 400)
+        if not isinstance(data, dict):
+            return failure("Invalid JSON.", 400)
+        if type(data.get("project_id")) is not int:
+            return failure("Invalid project_id.", 422)
+        if data["project_id"] != project_id:
+            return failure("Project does not match token.", 403)
+
+        name = data.get("name")
+        token = data.get("token")
+        if name not in SOURCE_NAMES:
+            return failure("Invalid source name.", 422)
+        if not isinstance(token, str) or not token or len(token) > (255 if name == "chat" else 4096):
+            return failure("Invalid source token.", 422)
+        if any(ord(c) < 33 or ord(c) > 126 for c in token):
+            return failure("Invalid source token.", 422)
+        if name == "whatsapp":
+            return failure("WhatsApp requires a verified phone number ID; registration not implemented.", 501)
+        try:
+            robot_id = await resolve_robot_id(name, token)
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError):
+            return failure("Platform API unavailable.", 502)
+        except ValueError:
+            return failure("Platform did not validate the source.", 422)
+        try:
+            source_id = await register_source(pool, project_id, name, robot_id, token)
+        except IntegrityError as exc:
+            if exc.args and exc.args[0] == 1062:
+                return failure("Source already registered.", 409)
+            raise
+        return web.json_response({
+            "status": True, "id": source_id, "name": name,
+            "robot_id": robot_id, "project_id": project_id,
+        }, status=201)
+
+    app.router.add_post("/api/sources", add_source)
 
     def room(project_id):
         return f"project:{project_id}"

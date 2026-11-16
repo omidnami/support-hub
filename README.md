@@ -92,3 +92,31 @@ Use this token directly in the existing Socket.IO auth object. No separate
 HTTP process, dependency or migration is required. This endpoint creates an
 initial user/project only; login, duplicate-account policy and additional
 project management are not part of this step.
+
+## Source registration
+
+Apply the additional migration with `python database.py` before starting the updated server.
+
+POST /api/sources
+
+Authorization: Bearer <project token>
+
+```json
+{"name":"bale","token":"<bot token>","project_id":1}
+```
+
+The project ID must match the project token. The server calls the platform to
+retrieve the actual robot ID: Bale, Telegram, Rubika and Eitaa (EitaaYar) use
+getMe; Instagram Login uses the professional account user_id from /me.
+For chat, token and robot_id are identical (no external request).
+The new sources.token column stores the supplied source token.
+Existing sources are not changed by the migration; duplicate source identities
+return 409. Responses never echo the source token. WhatsApp is reserved in the
+ENUM but returns 501 until its phone-number-ID registration flow is defined.
+
+```json
+{"status":true,"id":1,"name":"bale","robot_id":"123456","project_id":1}
+```
+
+Registration only; it does not start polling, register a webhook or change the
+Socket.IO relay. Live provider validation has not yet been tested.
