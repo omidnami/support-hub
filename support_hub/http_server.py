@@ -10,6 +10,7 @@ from .config import valid_identifier
 from .channels.instagram import valid_account, verified_signature
 from .database import digest
 from .management import install_management
+from .registration import install_registration
 from .protocol import ProtocolError, decode
 from .security import Bucket
 
@@ -121,6 +122,7 @@ def build_app(db, manager):
 
     app = web.Application(client_max_size=64 * 1024, middlewares=[protection])
     app.router.add_get("/health", health)
+    install_registration(app, db)
     app.router.add_post("/v1/tenants/{tenant}/clients/{owner}/browser-sessions", browser_session)
     app.router.add_get("/webhook/instagram", instagram_verify)
     app.router.add_post("/webhook/instagram", instagram_webhook)
