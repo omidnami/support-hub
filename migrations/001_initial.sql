@@ -1,0 +1,26 @@
+CREATE TABLE IF NOT EXISTS users (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(190) NOT NULL,
+    email VARCHAR(254) NOT NULL,
+    phone VARCHAR(32) NOT NULL,
+    password VARCHAR(255) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS projects (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    user_id BIGINT UNSIGNED NOT NULL,
+    name VARCHAR(190) NOT NULL,
+    domain VARCHAR(253) NULL,
+    description TEXT NULL,
+    token VARBINARY(255) NOT NULL UNIQUE,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS sources (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    name ENUM('rubika','bale','telegram','whatsapp','instagram','eitaa','chat') NOT NULL,
+    robot_id VARCHAR(255) COLLATE utf8mb4_bin NOT NULL,
+    project_id BIGINT UNSIGNED NOT NULL,
+    UNIQUE (name, robot_id),
+    FOREIGN KEY (project_id) REFERENCES projects(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
