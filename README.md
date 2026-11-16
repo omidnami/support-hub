@@ -297,141 +297,89 @@ curl -X DELETE 'http://127.0.0.1:8765/api/sources/12' \
 حذف فقط روی رکورد منبع در Support Hub انجام می‌شود.
 
 <a id="socket"></a>
-## ۴. اتصال Socket.IO
+## ۴. Socket.IO
 
-از Socket.IO v4 با WebSocket transport استفاده کنید. WebSocket بومی نیز در صورت پیاده‌سازی فریم‌های Engine.IO v4 و Socket.IO قابل استفاده است.
-
-| مشخصه | مقدار |
-| --- | --- |
-| آدرس نمونه | `http://127.0.0.1:8765` |
-| Path | `/socket.io/` |
-| Transport | websocket |
-| رویداد پیام | chat |
-| رویداد خطا | chat_error |
+- آدرس: `http://127.0.0.1:8765` (در Production آدرس HTTPS سرویس)
+- پروتکل: Socket.IO v4، مسیر `/socket.io/`، انتقال WebSocket
 
 ### ۴.۱. اتصال اپراتور
 
 ```javascript
-import { io } from "socket.io-client";
-
-const operator = io("http://127.0.0.1:8765", {
+const operator = io(HUB_URL, {
   transports: ["websocket"],
-  auth: { token: "PROJECT_TOKEN" },
+  auth: { token: PROJECT_TOKEN },
   autoConnect: false
 });
+
 operator.on("authenticated", ({ project_id }) => console.log(project_id));
-operator.on("connect", () => console.log(operator.connected)); // true
-operator.on("disconnect", () => console.log(operator.connected)); // false
-operator.on("chat", (message) => console.log(message));
-operator.on("chat_error", (error) => console.error(error.message));
-operator.on("connect_error", (error) => console.error(error.message));
+operator.on("connect", () => console.log("online"));
+operator.on("disconnect", () => console.log("offline"));
+operator.on("connect_error", () => console.log("offline"));
 operator.connect();
 ```
 
-پاسخ رویداد `authenticated`:
+توکن فقط هنگام اتصال بررسی می‌شود: سرور `projects.id` را از روی `projects.token` پیدا می‌کند و اتصال را در Room همان پروژه در RAM نگه می‌دارد. در اتصال مجدد، احراز هویت تکرار می‌شود. توکن در پیام‌ها ارسال نمی‌شود.
 
-```json
-{"role":"operator","project_id":1}
-```
+### ۴.۲. اتصال کلاینت (بدون توکن پروژه)
 
-توکن پروژه فقط در handshake هر اتصال بررسی می‌شود (و برای REST API طبق بخش ۲). سرور از جدول projects ستون id را می‌خواند و اتصال را در Session و Room داخلی Socket.IO در RAM قرار می‌دهد. رویداد authenticated فقط اطلاعات پروژه را برمی‌گرداند؛ وضعیت آنلاین/آفلاین از connect، disconnect و socket.connected تعیین می‌شود. در اتصال مجدد، احراز هویت دوباره انجام می‌شود.
-
-Heartbeat داخلی Engine.IO: سرور هر ۲۵ ثانیه ping می‌فرستد؛ مهلت pong کلاینت ۲۰ ثانیه است. Socket.IO قطع ارتباط و خروج از Room را خودکار مدیریت می‌کند. Ping/Pong اختصاصی لازم نیست. کلاینت استاندارد هنگام قطع موقت ارتباط خودکار تلاش به اتصال مجدد می‌کند. قبل از ارسال پیام، socket.connected را بررسی کنید.
-
-مراجع رسمی: [Python Socket.IO Server](https://python-socketio.readthedocs.io/en/stable/server.html) · [Socket.IO Client lifecycle](https://socket.io/docs/v4/client-socket-instance/) · [Heartbeat](https://socket.io/docs/v4/how-it-works/)
-
-### ۴.۲. اتصال کلاینت چت
-
-ابتدا مالک پروژه یک منبع chat از طریق REST API ثبت می‌کند (بخش ۳.۴)، مثلاً با توکن `my-shop-chat` که robot_id آن نیز همین مقدار خواهد بود.
+پس از ثبت منبع `chat` توسط مدیر پروژه (بخش ۳.۴):
 
 ```javascript
-const client = io("http://127.0.0.1:8765", {
+const client = io(HUB_URL, {
   transports: ["websocket"],
   auth: {
     role: "client",
     robot_id: "my-shop-chat",
-    user_id: "customer-101"
-  },
-  autoConnect: false
+    user_id: "101"
+  }
 });
-client.on("authenticated", (identity) => console.log(identity));
-client.on("connect", () => console.log(client.connected));
-client.on("disconnect", () => console.log(client.connected));
-client.on("chat", (message) => console.log(message));
-client.on("chat_error", (error) => console.error(error.message));
-client.on("connect_error", (error) => console.error(error.message));
-client.connect();
 ```
 
-پاسخ رویداد `authenticated`:
+کلاینت هیچ توکن احراز هویت پروژه یا توکن ربات پیام‌رسانی ارسال نمی‌کند. `auth` نام گزینه اتصال Socket.IO است؛ در این مثال فقط شامل شناسه‌هاست. سرور از روی منبع `chat` و robot_id، پروژه را پیدا می‌کند. شناسه عمومی chat همان robot_id ثبت‌شده است.
+
+**محدودیت فعلی:** مالکیت user_id مستقلاً تأیید نمی‌شود؛ بنابراین این روش به تنهایی برای احراز هویت مشتری در محیط عمومی کافی نیست.
+
+### ۴.۳. قالب مشترک پیام
+
+هر دو سمت با رویداد `chat` پیام را در یک قالب ارسال و دریافت می‌کنند:
 
 ```json
-{"role":"client","robot_id":"my-shop-chat","user_id":"customer-101"}
+{
+  "user_id": "101",
+  "sender": "client",
+  "text": "سلام",
+  "file": null,
+  "robot_id": "my-shop-chat",
+  "timestamp": 1794841200000,
+  "source": "chat"
+}
 ```
 
-توکن پروژه یا توکن ربات پیام‌رسان در اختیار کلاینت قرار نمی‌گیرد. سرور منبع chat را در دیتابیس پیدا می‌کند و اتصال را به گفتگوی همان شناسه کاربر و منبع در پروژه مرتبط محدود می‌کند.
-
-**محدودیت احراز هویت کلاینت:** شناسه کاربر توسط برنامه متصل تعیین می‌شود؛ این نسخه مالکیت آن را مستقلاً اعتبارسنجی نمی‌کند. برای تست محلی مناسب است، اما برای چت عمومی واقعی، دانستن robot_id و user_id نباید به تنهایی اجازه ورود به گفتگوی شخص دیگری بدهد. چگونگی احراز هویت کلاینت قبل از استقرار عمومی باید تعیین شود.
-
-### ۴.۳. قالب واحد پیام
-
-هر دو سمت با رویداد `chat` یک شیء JSON هفت‌فیلدی ارسال و دریافت می‌کنند.
-
-| فیلد | نوع | کاربرد |
-| --- | --- | --- |
-| user_id | string | شناسه کاربر/مشتری گفتگو، در هر دو جهت |
-| sender | string | client یا operator |
-| text | string | متن؛ در پیام صرفاً فایلی می‌تواند خالی باشد |
-| file | null / string / object | مرجع فایل یا اطلاعات فایل؛ بدون ذخیره یا آپلود در Hub |
-| robot_id | string | شناسه منبع |
-| timestamp | integer | Unix timestamp بر حسب میلی‌ثانیه |
-| source | string | نام منبع مانند chat، bale یا telegram |
-
-شناسه‌ها می‌توانند به صورت integer نیز ارسال شوند و سرور آن‌ها را به string تبدیل می‌کند. هر هفت فیلد ضروری است. نقش ارسال‌کننده و شناسه‌های کلاینت با Session اتصال تطبیق داده می‌شوند.
-
-ارسال کلاینت، پس از اتصال معتبر:
+- `sender`: client یا operator؛ `user_id` در هر دو جهت شناسه مشتری است.
+- `file`: null، رشته یا شیء JSON؛ فایل در Hub ذخیره نمی‌شود.
+- `timestamp`: Unix timestamp بر حسب میلی‌ثانیه.
+- `source + robot_id`: شناسه یکتای منبع برای یافتن `sources.project_id`.
 
 ```javascript
-client.emit("chat", {
-  user_id: "customer-101",
-  sender: "client",
-  text: "Hello",
-  file: null,
-  robot_id: "my-shop-chat",
-  timestamp: Date.now(),
-  source: "chat"
-});
+// socket می‌تواند operator یا client باشد.
+socket.on("chat", (message) => console.log(message));
+socket.on("chat_error", (error) => console.error(error.message));
+if (socket.connected) socket.emit("chat", message);
 ```
 
-ارسال پاسخ اپراتور:
+هر هفت فیلد الزامی‌اند. مسیر پیام با پروژه و هویت اتصال تطبیق داده می‌شود. پیام به اپراتورهای همان پروژه و اتصال‌های همان گفتگو، شامل فرستنده، ارسال می‌شود. ارسال پاسخ به پیام‌رسان‌های غیر chat هنوز پیاده‌سازی نشده است.
 
-```javascript
-operator.emit("chat", {
-  user_id: "customer-101",
-  sender: "operator",
-  text: "How can I help?",
-  file: null,
-  robot_id: "my-shop-chat",
-  timestamp: Date.now(),
-  source: "chat"
-});
-```
+### ۴.۴. Ping/Pong و وضعیت اتصال
 
-پیام به تمام اپراتورهای همان پروژه و اتصال‌های همان گفتگو ارسال می‌شود (شامل فرستنده). کلاینت‌های دیگر و پروژه‌های دیگر پیام را دریافت نمی‌کنند. پروژه مقصد با ترکیب source (ستون sources.name) و robot_id پیدا می‌شود و sources.project_id باید با projects.id ثبت‌شده در Session اتصال مطابقت داشته باشد. یکتایی robot_id در هر منبع مستقل است.
+Heartbeat داخلی Engine.IO: `ping_interval=20` و `ping_timeout=20` (ثانیه). سرور هر ۲۰ ثانیه Ping می‌فرستد و کلاینت خودکار Pong می‌دهد. اگر پاسخ در مهلت مقرر نرسد، اتصال قطع می‌شود و Socket.IO آن را از Room خارج می‌کند.
 
-خطاهای پیام با `chat_error` فقط به فرستنده ارسال می‌شوند:
+وضعیت آنلاین: `socket.connected === true`؛ وضعیت آفلاین: رویداد `disconnect` یا `connect_error`. هنگام آفلاین بودن ارسال غیرفعال شود. کلاینت استاندارد Socket.IO برای قطع موقت شبکه اتصال مجدد را مدیریت می‌کند. Ping/Pong سفارشی لازم نیست.
 
-```json
-{"status":false,"message":"Source not found in project."}
-```
+### ۴.۵. اتصال منابع دیگر
 
-در صورت استفاده از callback تأیید Socket.IO، نتیجه موفق `{"status":true}` به معنی مسیریابی است، نه تضمین دریافت نهایی. پیام‌ها ذخیره نمی‌شوند.
+تابع داخلی `emit_source(name, robot_id, "chat", payload)` برای رساندن پیام هفت‌فیلدی از آداپترهای آینده به پروژه است؛ API عمومی نیست. سرویس ارسال و دریافت پیام‌رسان‌ها هنوز پیاده‌سازی نشده است.
 
-### ۴.۴. پیام‌رسان‌ها و منابع دیگر
-
-تابع داخلی `emit_source(name, robot_id, "chat", payload)` برای آداپترهای آینده باقی مانده است. این تابع قالب پیام را کنترل می‌کند و از ترکیب name و robot_id پروژه را پیدا می‌کند تا پیام به اپراتورهای همان پروژه برسد. تابع API عمومی نیست. ارسال پاسخ اپراتور به منابع غیر chat فعلاً با خطا رد می‌شود تا آداپتر آن پیام‌رسان پیاده‌سازی شود. توکن ربات فقط برای API پلتفرم به کار می‌رود.
-
-نمونه‌های مرورگر باید از همان Origin سرور اجرا شوند؛ CORS دامنه‌های دیگر هنوز تنظیم نشده است.
+سیاست Origin پیش‌فرض Socket.IO فعال است؛ اتصال مرورگر از Origin دیگر هنوز تنظیم نشده است.
 
 <a id="status-codes"></a>
 ## ۵. کدهای وضعیت HTTP

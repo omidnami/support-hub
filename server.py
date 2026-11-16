@@ -64,7 +64,7 @@ def create_app():
     app = web.Application()
     sio = socketio.AsyncServer(
         async_mode="aiohttp", transports=["websocket"],
-        ping_interval=25, ping_timeout=20,
+        ping_interval=20, ping_timeout=20,
     )
     sio.attach(app)
 
