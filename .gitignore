@@ -1,0 +1,34 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Tooling and test artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Editors and OS files
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*~
+
+# Logs and local databases
+*.log
+*.sqlite
+*.sqlite3

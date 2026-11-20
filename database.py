@@ -5,15 +5,28 @@ import secrets
 from pathlib import Path
 
 import aiomysql
+from pymysql.err import IntegrityError
+
+from config import load_env_file
+
+
+load_env_file()
+
+
+def required_env(name):
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
 
 
 async def open_database():
     return await aiomysql.create_pool(
         host=os.getenv("HUB_DB_HOST", "127.0.0.1"),
         port=int(os.getenv("HUB_DB_PORT", "3306")),
-        user=os.environ["HUB_DB_USER"],
-        password=os.environ["HUB_DB_PASSWORD"],
-        db=os.environ["HUB_DB_NAME"],
+        user=required_env("HUB_DB_USER"),
+        password=required_env("HUB_DB_PASSWORD"),
+        db=required_env("HUB_DB_NAME"),
         charset="utf8mb4",
         autocommit=True,
     )
@@ -26,6 +39,12 @@ def hash_password(password):
         "sha256", password.encode("utf-8"), bytes.fromhex(salt), iterations
     ).hex()
     return f"pbkdf2_sha256${iterations}${salt}${digest}"
+
+
+def _decode_token(value):
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("ascii")
+    return str(value)
 
 
 async def register_user(pool, name, email, phone, password, project_name,
@@ -46,6 +65,7 @@ async def register_user(pool, name, email, phone, password, project_name,
                     "VALUES (%s, %s, %s, %s, %s)",
                     (user_id, project_name, domain, description, token),
                 )
+                project_id = cursor.lastrowid
             await conn.commit()
         except BaseException:
             try:
@@ -54,7 +74,7 @@ async def register_user(pool, name, email, phone, password, project_name,
                 conn.close()
                 raise
             raise
-    return token
+    return token, project_id
 
 
 async def authenticate_project(pool, token):
@@ -67,6 +87,38 @@ async def authenticate_project(pool, token):
             return row[0] if row else None
 
 
+async def get_project_token(pool, project_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT token FROM projects WHERE id = %s", (project_id,))
+            row = await cursor.fetchone()
+            return _decode_token(row[0]) if row else None
+
+
+async def rotate_project_token(pool, project_id):
+    for _ in range(5):
+        token = secrets.token_hex(16)
+        try:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute(
+                        "UPDATE projects SET token = %s WHERE id = %s",
+                        (token, project_id),
+                    )
+                    if cursor.rowcount:
+                        return token
+                    # An unchanged token is also a successful update.
+                    await cursor.execute(
+                        "SELECT id FROM projects WHERE id = %s", (project_id,)
+                    )
+                    return token if await cursor.fetchone() else None
+        except IntegrityError as exc:
+            if exc.args and exc.args[0] == 1062:
+                continue
+            raise
+    raise RuntimeError("Could not generate a unique project token.")
+
+
 async def find_source_project(pool, name, robot_id):
     async with pool.acquire() as conn:
         async with conn.cursor() as cursor:
@@ -76,6 +128,21 @@ async def find_source_project(pool, name, robot_id):
             )
             row = await cursor.fetchone()
             return row[0] if row else None
+
+
+async def find_source_project_with_token(pool, name, robot_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT p.id, p.token FROM sources s "
+                "JOIN projects p ON p.id = s.project_id "
+                "WHERE s.name = %s AND s.robot_id = %s",
+                (name, str(robot_id)),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            return row[0], _decode_token(row[1])
 
 
 async def register_source(pool, project_id, name, robot_id, token):
@@ -90,6 +157,8 @@ async def register_source(pool, project_id, name, robot_id, token):
 
 async def update_user(pool, project_id, values):
     values = {key: values[key] for key in ("name", "email", "phone", "password") if key in values}
+    if not values:
+        return
     if "password" in values:
         values["password"] = await asyncio.to_thread(hash_password, values["password"])
     assignments = ", ".join(f"u.{key} = %s" for key in values)
@@ -103,6 +172,8 @@ async def update_user(pool, project_id, values):
 
 async def update_project(pool, project_id, values):
     values = {key: values[key] for key in ("name", "domain", "description") if key in values}
+    if not values:
+        return
     assignments = ", ".join(f"{key} = %s" for key in values)
     async with pool.acquire() as conn:
         async with conn.cursor() as cursor:
