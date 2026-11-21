@@ -196,19 +196,45 @@ async def get_source_name(pool, project_id, source_id):
 
 async def update_source_token(pool, project_id, source_id, robot_id, token):
     async with pool.acquire() as conn:
-        async with conn.cursor() as cursor:
-            await cursor.execute(
-                "UPDATE sources SET token = %s, robot_id = %s WHERE id = %s AND project_id = %s",
-                (token, robot_id, source_id, project_id),
-            )
-            if cursor.rowcount:
-                return True
-            # An unchanged token and robot ID are also a successful update.
-            await cursor.execute(
-                "SELECT id FROM sources WHERE id = %s AND project_id = %s",
-                (source_id, project_id),
-            )
-            return (await cursor.fetchone()) is not None
+        # Token changes invalidate the Bale webhook secret and dedup cursor:
+        # both belong to the previous bot. Lock the row while comparing so a
+        # concurrent update cannot leave stale Bale state behind.
+        await conn.begin()
+        try:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    "SELECT token, robot_id FROM sources "
+                    "WHERE id = %s AND project_id = %s FOR UPDATE",
+                    (source_id, project_id),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    await conn.rollback()
+                    return False
+                changed = (
+                    _decode_token(row[0]) != token or str(row[1]) != str(robot_id)
+                )
+                if changed:
+                    await cursor.execute(
+                        "UPDATE sources SET token = %s, robot_id = %s, "
+                        "webhook_secret = NULL, last_update_id = NULL "
+                        "WHERE id = %s AND project_id = %s",
+                        (token, robot_id, source_id, project_id),
+                    )
+                else:
+                    await cursor.execute(
+                        "UPDATE sources SET token = %s, robot_id = %s "
+                        "WHERE id = %s AND project_id = %s",
+                        (token, robot_id, source_id, project_id),
+                    )
+            await conn.commit()
+            return True
+        except BaseException:
+            try:
+                await conn.rollback()
+            except BaseException:
+                pass
+            raise
 
 
 async def delete_source(pool, project_id, source_id):

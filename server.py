@@ -54,6 +54,9 @@ HTTP_RATE_LIMITS = {
 }
 MESSAGE_LIMIT = 30
 MESSAGE_WINDOW = 10
+BRIDGE_PROVIDERS = ("bale",)
+BRIDGE_MESSAGE_LIMIT = 10_000
+BRIDGE_MESSAGE_WINDOW = 10
 
 
 def failure(message, status):
@@ -110,6 +113,22 @@ def client_room(project_id, source, robot_id, user_id):
     return "chat:" + json.dumps(
         [project_id, source, robot_id, user_id], ensure_ascii=True, separators=(",", ":")
     )
+
+
+def bridge_room(provider):
+    return f"bridge:{provider}"
+
+
+def valid_bridge_token(provider, token, expected=None):
+    if provider not in BRIDGE_PROVIDERS:
+        return False
+    if expected is None:
+        expected = os.getenv("HUB_BALE_SERVICE_TOKEN", "")
+    if not expected or not expected.isascii():
+        return False
+    if not isinstance(token, str) or not token.isascii():
+        return False
+    return hmac.compare_digest(token, expected)
 
 
 def parse_path_id(value):
@@ -359,6 +378,8 @@ def create_app():
     sio = socketio.AsyncServer(async_mode="aiohttp", transports=["websocket"])
     sio.attach(app)
 
+    bridge_sids = {provider: set() for provider in BRIDGE_PROVIDERS}
+    bridge_connecting = {provider: False for provider in BRIDGE_PROVIDERS}
     pool = None
 
     async def database_context(_app):
@@ -668,12 +689,39 @@ def create_app():
             await sio.emit("authenticated", {
                 "role": role, "robot_id": robot_id, "user_id": user_id,
             }, to=sid)
+        elif role == "bridge":
+            provider = auth.get("provider")
+            if not valid_bridge_token(provider, auth.get("token")):
+                return False
+            # Duplicate bridges would send every operator reply twice. Reserve
+            # the provider slot before the first await so two concurrent
+            # connections cannot both pass this check.
+            if bridge_sids[provider] or bridge_connecting[provider]:
+                logger.warning("Rejected a duplicate bridge connection for %s.", provider)
+                return False
+            bridge_connecting[provider] = True
+            try:
+                await sio.save_session(sid, {"role": role, "provider": provider})
+                await sio.enter_room(sid, bridge_room(provider))
+                bridge_sids[provider].add(sid)
+                await sio.emit("authenticated", {
+                    "role": role, "provider": provider,
+                }, to=sid)
+            except BaseException:
+                bridge_sids[provider].discard(sid)
+                raise
+            finally:
+                bridge_connecting[provider] = False
         else:
             return False
 
     @sio.event
     async def disconnect(sid, reason=None):
         message_limiter.clear(("chat", sid))
+        for provider, sids in bridge_sids.items():
+            if sid in sids:
+                sids.discard(sid)
+                message_limiter.clear(("bridge", provider))
 
     async def chat_failure(sid, message):
         result = {"status": False, "message": message}
@@ -685,14 +733,33 @@ def create_app():
         session = await sio.get_session(sid)
         role = session.get("role")
         project_id = session.get("project_id")
-        if role not in ("operator", "client") or project_id is None:
+        if role == "bridge":
+            provider = session.get("provider")
+            if provider not in BRIDGE_PROVIDERS:
+                return await chat_failure(sid, "Not authenticated.")
+        elif role in ("operator", "client"):
+            provider = None
+            if project_id is None:
+                return await chat_failure(sid, "Not authenticated.")
+        else:
             return await chat_failure(sid, "Not authenticated.")
-        if not message_limiter.allow(("chat", sid), MESSAGE_LIMIT, MESSAGE_WINDOW):
+
+        if role == "bridge":
+            limit_key = ("bridge", provider)
+            limit = BRIDGE_MESSAGE_LIMIT
+            window = BRIDGE_MESSAGE_WINDOW
+        else:
+            limit_key = ("chat", sid)
+            limit = MESSAGE_LIMIT
+            window = MESSAGE_WINDOW
+        if not message_limiter.allow(limit_key, limit, window):
             return await chat_failure(sid, "Too many messages. Please slow down.")
         if len(args) != 1:
             return await chat_failure(sid, "Expected one message object.")
+
+        expected_sender = "client" if role == "bridge" else role
         try:
-            payload = message_payload(args[0], role)
+            payload = message_payload(args[0], expected_sender)
         except ValueError as exc:
             return await chat_failure(sid, str(exc))
         source, robot_id, user_id = payload["source"], payload["robot_id"], payload["user_id"]
@@ -702,15 +769,36 @@ def create_app():
         ):
             return await chat_failure(sid, "Message does not match the connected client.")
 
-        # The source identifies the project, but cannot override the session.
-        if await find_source_project(pool, source, robot_id) != project_id:
-            return await chat_failure(sid, "Source not found in project.")
-        if source != "chat":
-            return await chat_failure(sid, "Provider messaging is not implemented yet.")
+        # The source identifies the project and cannot override the session.
+        source_project = await find_source_project(pool, source, robot_id)
+        if role == "bridge":
+            if source != provider:
+                return await chat_failure(sid, "Bridge cannot send this source.")
+            if source_project is None:
+                return await chat_failure(sid, "Source not found.")
+            await emit_project(source_project, "chat", payload)
+            return {"status": True}
 
-        # Echo to the project's operators and the target conversation only.
+        if source_project != project_id:
+            return await chat_failure(sid, "Source not found in project.")
+
+        if source == "chat":
+            # Echo to the project's operators and the target conversation only.
+            await emit_project(project_id, "chat", payload)
+            await sio.emit(
+                "chat", payload,
+                room=client_room(project_id, source, robot_id, user_id),
+            )
+            return {"status": True}
+
+        if source not in BRIDGE_PROVIDERS:
+            return await chat_failure(sid, "Provider messaging is not implemented yet.")
+        if not bridge_sids.get(source):
+            return await chat_failure(sid, "Provider bridge is offline.")
+
+        # Operators see their own reply; the provider bridge sends it to the platform.
         await emit_project(project_id, "chat", payload)
-        await sio.emit("chat", payload, room=client_room(project_id, source, robot_id, user_id))
+        await sio.emit("chat", payload, room=bridge_room(source))
         return {"status": True}
 
     # Socket.IO automatically removes disconnected sockets from their rooms.

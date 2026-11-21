@@ -1,6 +1,8 @@
 import asyncio
+import os
 import time
 import unittest
+from unittest import mock
 
 import socketio
 from aiohttp.test_utils import TestServer
@@ -46,6 +48,8 @@ class _Pool:
 
 PROJECT_TOKEN = "project-token"
 ROBOT_ID = "my-shop-chat"
+BALE_ROBOT_ID = "bale-bot"
+BALE_SERVICE_TOKEN = "bale-service-token-for-tests"
 
 
 async def _open_database():
@@ -57,7 +61,7 @@ async def _authenticate_project(pool, token):
 
 
 async def _find_source_project(pool, name, robot_id):
-    if (name, robot_id) == ("chat", ROBOT_ID):
+    if (name, robot_id) in (("chat", ROBOT_ID), ("bale", BALE_ROBOT_ID)):
         return 1
     return None
 
@@ -66,6 +70,18 @@ async def _find_source_project_with_token(pool, name, robot_id):
     if (name, robot_id) == ("chat", ROBOT_ID):
         return 1, PROJECT_TOKEN
     return None
+
+
+def bale_payload(sender="client", text="hello", user_id="501"):
+    return {
+        "user_id": user_id,
+        "sender": sender,
+        "text": text,
+        "file": None,
+        "robot_id": BALE_ROBOT_ID,
+        "timestamp": 1794841200000,
+        "source": "bale",
+    }
 
 
 class SocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -81,6 +97,10 @@ class SocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
         server.authenticate_project = _authenticate_project
         server.find_source_project = _find_source_project
         server.find_source_project_with_token = _find_source_project_with_token
+        self.env_patch = mock.patch.dict(
+            os.environ, {"HUB_BALE_SERVICE_TOKEN": BALE_SERVICE_TOKEN}
+        )
+        self.env_patch.start()
 
         self.app, self.sio, self.emit_source = server.create_app()
         self.test_server = TestServer(self.app)
@@ -93,6 +113,7 @@ class SocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
             if client.connected:
                 await client.disconnect()
         await self.test_server.close()
+        self.env_patch.stop()
         for name, function in self.original_functions.items():
             setattr(server, name, function)
 
@@ -114,6 +135,22 @@ class SocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         await asyncio.wait_for(authenticated.wait(), timeout=2)
         return operator
+
+    async def connect_bridge(self, token=BALE_SERVICE_TOKEN):
+        bridge = self.new_client()
+        authenticated = asyncio.Event()
+
+        @bridge.on("authenticated")
+        async def on_authenticated(data):
+            authenticated.set()
+
+        await bridge.connect(
+            self.url,
+            auth={"role": "bridge", "provider": "bale", "token": token},
+            transports=["websocket"],
+        )
+        await asyncio.wait_for(authenticated.wait(), timeout=2)
+        return bridge
 
     async def connect_client(self, user_id="101", signature=None, expires=None):
         client = self.new_client()
@@ -191,6 +228,76 @@ class SocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await operator.connect(
                 self.url, auth={"token": "invalid"}, transports=["websocket"]
             )
+
+    async def test_bale_bridge_requires_service_token(self):
+        with self.assertRaises(socketio.exceptions.ConnectionError):
+            await self.connect_bridge(token="wrong-token")
+
+    async def test_only_one_bale_bridge_is_active(self):
+        await self.connect_bridge()
+        with self.assertRaises(socketio.exceptions.ConnectionError):
+            await self.connect_bridge()
+
+    async def test_concurrent_bridge_connections_allow_only_one(self):
+        results = await asyncio.gather(
+            self.connect_bridge(), self.connect_bridge(), return_exceptions=True
+        )
+        connected = [result for result in results
+                     if not isinstance(result, BaseException)]
+        self.assertEqual(len(connected), 1)
+
+    async def test_bale_bridge_inbound_reaches_operator(self):
+        operator = await self.connect_operator()
+        bridge = await self.connect_bridge()
+        received = asyncio.Event()
+        messages = []
+
+        @operator.on("chat")
+        async def on_chat(data):
+            messages.append(data)
+            received.set()
+
+        payload = bale_payload()
+        ack = await bridge.call("chat", payload)
+        await asyncio.wait_for(received.wait(), timeout=2)
+        self.assertEqual(ack, {"status": True})
+        self.assertEqual(messages, [payload])
+
+    async def test_operator_bale_reply_reaches_bridge(self):
+        operator = await self.connect_operator()
+        bridge = await self.connect_bridge()
+        received = asyncio.Event()
+        messages = []
+
+        @bridge.on("chat")
+        async def on_chat(data):
+            messages.append(data)
+            received.set()
+
+        payload = bale_payload(sender="operator", text="reply")
+        ack = await operator.call("chat", payload)
+        await asyncio.wait_for(received.wait(), timeout=2)
+        self.assertEqual(ack, {"status": True})
+        self.assertEqual(messages, [payload])
+
+    async def test_operator_bale_reply_is_rejected_when_bridge_is_offline(self):
+        operator = await self.connect_operator()
+        ack = await operator.call("chat", bale_payload(sender="operator"))
+        self.assertEqual(
+            ack,
+            {"status": False, "message": "Provider bridge is offline."},
+        )
+
+    async def test_bale_bridge_cannot_send_an_internal_chat_source(self):
+        bridge = await self.connect_bridge()
+        payload = bale_payload()
+        payload["source"] = "chat"
+        payload["robot_id"] = ROBOT_ID
+        ack = await bridge.call("chat", payload)
+        self.assertEqual(
+            ack,
+            {"status": False, "message": "Bridge cannot send this source."},
+        )
 
 
 if __name__ == "__main__":
