@@ -7,6 +7,7 @@
 ## فهرست مستندات
 
 - [معماری کامل](docs/architecture.md)
+- [حافظه پروژه برای مدل/ایجنت](AGENTS.md)
 - [راه‌اندازی](#setup)
 - [احراز هویت](#authentication)
 - [REST API](#rest-api)
@@ -46,21 +47,47 @@ chmod 600 .env
 | `HUB_DB_PASSWORD` | — | رمز دیتابیس (ضروری) |
 | `HUB_HOST` | `127.0.0.1` | آدرس اجرا |
 | `HUB_PORT` | `8765` | پورت اجرا |
-| `HUB_TRUST_PROXY` | `0` | فقط پشت Reverse Proxy معتبر `1` شود تا IP از `X-Forwarded-For` خوانده شود |
+| `HUB_TRUST_PROXY` | `0` | فقط پشت Reverse Proxy معتبر `1` شود تا محدودیت نرخ IP را از `X-Forwarded-For` بخواند |
 | `HUB_LOG_LEVEL` | `INFO` | سطح لاگ برنامه |
-| `HUB_BALE_SERVICE_TOKEN` | — | توکن مشترک سرویس‌به‌سرویس برای اتصال bridge بله؛ باید در Hub و سرویس بله یکسان باشد |
+| `HUB_BALE_SERVICE_TOKEN` | — | توکن مشترک سرویس‌به‌سرویس برای اتصال bridge بله؛ برای اجرای سرویس بله الزامی است و باید در Hub و سرویس بله یکسان باشد |
 | `HUB_URL` | `http://127.0.0.1:8765` | آدرس Hub برای اتصال سرویس بله |
 | `BALE_API_BASE` | `https://tapi.bale.ai` | آدرس API بله |
-| `BALE_PUBLIC_BASE_URL` | — | آدرس عمومی HTTPS برای دریافت webhook بله |
+| `BALE_PUBLIC_BASE_URL` | `https://support.example.com` | آدرس عمومی HTTPS با پورت 443 یا 88؛ مگر اینکه ثبت webhook با `BALE_DISABLE_WEBHOOK_REGISTRATION=1` غیرفعال شود |
 | `BALE_SERVICE_HOST` | `127.0.0.1` | آدرس اجرای سرویس بله |
 | `BALE_SERVICE_PORT` | `8766` | پورت اجرای سرویس بله |
 | `BALE_SYNC_INTERVAL` | `30` | فاصله بررسی منابع بله در ثانیه |
 | `BALE_REQUEST_TIMEOUT` | `15` | مهلت درخواست به API بله |
 | `BALE_HUB_ACK_TIMEOUT` | `10` | مهلت ACK از Hub |
 | `BALE_MAX_UPDATE_BYTES` | `1048576` | حداکثر اندازه بدنه webhook |
-| `BALE_WEBHOOK_REQUIRE_HTTPS` | `1` | الزام HTTPS برای URL عمومی بله |
-| `BALE_DISABLE_WEBHOOK_REGISTRATION` | `0` | فقط برای توسعه محلی `1` شود |
+| `BALE_WEBHOOK_REQUIRE_HTTPS` | `1` | بررسی HTTPS و پورت 443 یا 88 برای URL عمومی؛ با غیرفعال‌بودن ثبت webhook اعمال نمی‌شود |
+| `BALE_DISABLE_WEBHOOK_REGISTRATION` | `0` | با `1` ثبت webhook بله انجام نمی‌شود و `BALE_PUBLIC_BASE_URL` لازم نیست؛ فقط برای توسعه محلی |
 | `BALE_LOG_LEVEL` | `INFO` | سطح لاگ سرویس بله |
+
+برای ساخت مقدار `HUB_BALE_SERVICE_TOKEN`:
+
+```bash
+python -c 'import secrets; print(secrets.token_hex(32))'
+```
+
+همین مقدار را در `.env` هر دو سرویس قرار دهید. Hub بدون این توکن هم بالا می‌آید، اما bridge بله احراز هویت نمی‌شود و سرویس بله بدون آن اصلاً اجرا نمی‌شود.
+
+### ساخت دیتابیس
+
+`python database.py` فقط مایگریشن‌ها را اجرا می‌کند و دیتابیس یا کاربر نمی‌سازد. یک‌بار با کاربر مدیر MariaDB دیتابیس و کاربر را بسازید (نمونه برای نصب محلی):
+
+```bash
+mariadb -u root -p
+```
+
+```sql
+CREATE DATABASE IF NOT EXISTS support_hub
+  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS 'hub_user'@'localhost' IDENTIFIED BY 'STRONG_PASSWORD';
+GRANT ALL PRIVILEGES ON support_hub.* TO 'hub_user'@'localhost';
+FLUSH PRIVILEGES;
+```
+
+مقادیر `HUB_DB_NAME`، `HUB_DB_USER` و `HUB_DB_PASSWORD` در `.env` باید با همین مقادیر یکی باشند. اگر دیتابیس روی سرور دیگری است، `HUB_DB_HOST` را تغییر دهید و دسترسی کاربر را برای همان هاست تنظیم کنید. اگر MariaDB با `skip-name-resolve` اجرا می‌شود، به‌جای `localhost` از `127.0.0.1` برای Host کاربر استفاده کنید. `CREATE USER IF NOT EXISTS` رمز کاربر موجود را تغییر نمی‌دهد؛ در آن صورت رمز را با `ALTER USER` هم‌راستا کنید.
 
 پس از ایجاد دیتابیس و تنظیم متغیرها:
 
@@ -75,7 +102,7 @@ python server.py
 python -m bale_service
 ```
 
-دستور اول مایگریشن‌ها را به ترتیب اجرا می‌کند. برای معماری جدید از دیتابیس تازه استفاده کنید؛ این مایگریشن‌ها جداول معماری قدیمی را حذف یا تبدیل نمی‌کنند. مایگریشن `003` دو ستون `webhook_secret` و `last_update_id` را به `sources` اضافه می‌کند.
+دستور اول مایگریشن‌ها را به ترتیب روی دیتابیس موجود اجرا می‌کند. اجرای دوباره آن بی‌خطر است، ولی MariaDB برای جدول‌ها و ستون‌های موجود هشدار `already exists` چاپ می‌کند. برای معماری جدید از دیتابیس تازه استفاده کنید؛ این مایگریشن‌ها جداول معماری قدیمی را حذف یا تبدیل نمی‌کنند. مایگریشن `003` دو ستون `webhook_secret` و `last_update_id` و ایندکس یکتای `uq_sources_webhook_secret` را به `sources` اضافه می‌کند.
 
 بررسی سلامت سرویس:
 
@@ -356,6 +383,8 @@ curl -X PATCH 'http://127.0.0.1:8765/api/sources/12' \
 
 سرور نوع منبع را از رکورد فعلی می‌خواند و پیش از ذخیره توکن، شناسه ربات را دوباره از پلتفرم دریافت می‌کند. در صورت خطای اعتبارسنجی یا تکراری بودن منبع، رکورد قبلی تغییر نمی‌کند.
 
+اگر توکن یا `robot_id` بله واقعاً تغییر کند، `webhook_secret` و `last_update_id` همان منبع پاک می‌شوند؛ چون هر دو به ربات قبلی تعلق دارند. سرویس بله در همگام‌سازی بعدی secret جدید می‌سازد و webhook را دوباره ثبت می‌کند. تا آن زمان webhook قبلی معتبر نیست و ممکن است چند پیام ورودی از دست برود.
+
 پاسخ موفق — HTTP 200:
 
 ```json
@@ -387,7 +416,7 @@ curl -X DELETE 'http://127.0.0.1:8765/api/sources/12' \
 {"status": true}
 ```
 
-حذف فقط روی رکورد منبع در Support Hub انجام می‌شود.
+حذف فقط روی رکورد منبع در Support Hub انجام می‌شود. سرویس بله در همگام‌سازی بعدی (حداکثر `BALE_SYNC_INTERVAL` ثانیه) webhook همان ربات را از بله حذف می‌کند.
 
 ### ۳.۷. تعویض توکن پروژه
 
@@ -561,7 +590,7 @@ const bridge = io(HUB_URL, {
 
 - مایگریشن `003_add_bale_webhook_metadata.sql` اجرا شده باشد.
 - `HUB_BALE_SERVICE_TOKEN` در Hub و سرویس بله یکسان باشد.
-- `BALE_PUBLIC_BASE_URL` یک دامنه HTTPS با پورت ۴۴۳ یا ۸۸ باشد.
+- `BALE_PUBLIC_BASE_URL` یک دامنه HTTPS با پورت ۴۴۳ یا ۸۸ باشد؛ اگر `BALE_DISABLE_WEBHOOK_REGISTRATION=1` باشد این مورد لازم نیست.
 - Reverse Proxy مسیر `‎/webhooks/bale/<secret>` را به سرویس بله برساند. بقیه مسیرها لازم نیستند.
 - لاگ دسترسی خود سرویس بله غیرفعال است تا secret داخل URL در لاگ نیاید. اگر Reverse Proxy لاگ دسترسی دارد، مسیر webhook را حذف یا ماسک کنید؛ این secret تنها لایه احراز هویت webhook است.
 
@@ -575,7 +604,7 @@ python -m bale_service
 curl 'http://127.0.0.1:8766/healthz'
 ```
 
-پاسخ سالم شامل `database: true`، `hub_connected: true` و تعداد منابع است. اگر Hub یا دیتابیس در دسترس نباشد، HTTP 503 برمی‌گردد.
+پاسخ سالم شامل `database: true`، `hub_connected: true` و تعداد منابع است. اگر دیتابیس در دسترس نباشد یا bridge بله هنوز متصل/احراز هویت نشده باشد، HTTP 503 برمی‌گردد.
 
 ### ۵.۲. ثبت webhook
 
@@ -583,7 +612,8 @@ curl 'http://127.0.0.1:8766/healthz'
 - برای هر منبع، یک `webhook_secret` تصادفی در `sources` ساخته می‌شود.
 - URL نهایی: `BALE_PUBLIC_BASE_URL + /webhooks/bale/ + webhook_secret`
 - سرویس با `setWebhook` آن را روی بله ثبت می‌کند. بله secret یا امضای درخواست ندارد؛ بنابراین secret داخل URL تنها لایه احراز هویت webhook است. این secret نباید در لاگ دسترسی سرویس یا Reverse Proxy ثبت شود.
-- هنگام حذف منبع یا تغییر توکن/شناسه ربات، webhook قبلی حذف و webhook جدید ثبت می‌شود.
+- هنگام تغییر توکن یا شناسه ربات، `webhook_secret` و `last_update_id` قبلی باطل می‌شوند و در همگام‌سازی بعدی webhook جدید ثبت می‌شود.
+- هنگام حذف منبع، سرویس در همگام‌سازی بعدی webhook همان ربات را حذف می‌کند.
 - اگر ثبت webhook در یک دوره شکست بخورد، در دوره بعدی دوباره تلاش می‌شود.
 
 ### ۵.۳. جریان ورودی
@@ -623,7 +653,7 @@ Bale → POST /webhooks/bale/<secret>
 - `reply_to_message_id` در قرارداد نیست.
 - پیام‌های آفلاین در Hub صف نمی‌شوند؛ تاریخچه در Hub وجود ندارد.
 - فقط یک نمونه از سرویس بله و یک نمونه از Hub باید اجرا شود.
-- برای توسعه محلی بدون دامنه عمومی، `BALE_DISABLE_WEBHOOK_REGISTRATION=1` و در صورت نیاز `BALE_WEBHOOK_REQUIRE_HTTPS=0` تنظیم کنید. در این حالت webhook بله واقعی کار نمی‌کند و فقط مسیر سرویس قابل تست است.
+- برای توسعه محلی بدون دامنه عمومی، `BALE_DISABLE_WEBHOOK_REGISTRATION=1` را تنظیم کنید؛ در این حالت `BALE_PUBLIC_BASE_URL` لازم نیست و `BALE_WEBHOOK_REQUIRE_HTTPS` اعمال نمی‌شود، اما webhook بله واقعی هم کار نمی‌کند. فقط مسیر سرویس قابل تست دستی است.
 
 <a id="status-codes"></a>
 ## ۶. کدهای وضعیت HTTP
