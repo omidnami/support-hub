@@ -4,6 +4,7 @@ import hmac
 import json
 import logging
 import os
+import secrets
 import time
 from collections import deque
 from urllib.parse import quote
@@ -15,10 +16,15 @@ from pymysql.err import IntegrityError
 
 from config import env_flag, load_env_file
 from database import (
-    authenticate_project, delete_source, find_source_project,
-    find_source_project_with_token, get_project_token, get_source_name,
-    open_database, register_source, register_user, rotate_project_token,
-    update_project, update_source_token, update_user,
+    authenticate_project, delete_project_webhook, delete_source,
+    find_source_project, find_source_project_with_token, get_project_token,
+    get_project_webhook, get_source_name, open_database, register_source,
+    register_user, rotate_project_token, set_project_webhook, update_project,
+    update_source_token, update_user,
+)
+from webhooks import (
+    StoreOffline, WebhookDeliveryError, WebhookError, deliver_webhook,
+    delivery_id_for, valid_delivery_id, validate_webhook_url,
 )
 
 
@@ -37,6 +43,7 @@ CLIENT_KEY_CONTEXT = b"support-hub/client-key/v1"
 REGISTER_FIELDS = {
     "name": 190, "email": 254, "phone": 32, "password": 255,
     "project_name": 190, "domain": 253, "description": 16383,
+    "webhook_url": 2048,
 }
 USER_FIELDS = {"name": 190, "email": 254, "phone": 32, "password": 255}
 PROJECT_FIELDS = {"name": 190, "domain": 253, "description": 16383}
@@ -50,6 +57,8 @@ HTTP_RATE_LIMITS = {
     ("PATCH", "/api/users/me"): (30, 60),
     ("PATCH", "/api/projects/{project_id}"): (30, 60),
     ("POST", "/api/projects/{project_id}/token"): (10, 60),
+    ("POST", "/api/projects/{project_id}/webhook"): (10, 60),
+    ("DELETE", "/api/projects/{project_id}/webhook"): (10, 60),
     ("GET", "/api/projects/{project_id}/client-key"): (30, 60),
 }
 MESSAGE_LIMIT = 30
@@ -144,7 +153,7 @@ def validate_register(data):
     values = {}
     for key, limit in REGISTER_FIELDS.items():
         value = data.get(key)
-        optional = key in ("domain", "description")
+        optional = key in ("domain", "description", "webhook_url")
         if value is None:
             if optional:
                 values[key] = None
@@ -156,6 +165,12 @@ def validate_register(data):
             value = value.strip()
         if not value.strip() and not optional:
             raise ValueError(f"Required field: {key}")
+        if key == "webhook_url":
+            try:
+                values[key] = validate_webhook_url(value) if value else None
+            except ValueError as exc:
+                raise ValueError(f"Invalid field: webhook_url. {exc}") from None
+            continue
         if key == "password" and len(value) < MIN_PASSWORD_LENGTH:
             raise ValueError(
                 f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
@@ -240,6 +255,32 @@ def message_payload(data, sender):
     if not data["text"].strip() and not file:
         raise ValueError("Message is empty.")
     return {**data, "user_id": user_id, "robot_id": robot_id, "sender": sender}
+
+
+def parse_bridge_metadata(metadata, default_chat_id):
+    """Return (chat_id, delivery_id, update_id) from optional bridge metadata."""
+    if metadata is None:
+        return default_chat_id, None, None
+    if not isinstance(metadata, dict) or set(metadata) - {
+            "chat_id", "delivery_id", "update_id"}:
+        raise ValueError("Invalid transport metadata.")
+    chat_id = metadata.get("chat_id")
+    if chat_id is None:
+        chat_id = default_chat_id
+    else:
+        chat_id = normalize_id(chat_id)
+        if chat_id is None:
+            raise ValueError("Invalid chat_id.")
+    delivery_id = metadata.get("delivery_id")
+    if delivery_id is not None and not valid_delivery_id(delivery_id):
+        raise ValueError("Invalid delivery_id.")
+    update_id = metadata.get("update_id")
+    if update_id is not None and (
+        type(update_id) is not int
+        or not 0 <= update_id <= 18446744073709551615
+    ):
+        raise ValueError("Invalid update_id.")
+    return chat_id, delivery_id, update_id
 
 
 class SlidingWindowLimiter:
@@ -380,6 +421,7 @@ def create_app():
 
     bridge_sids = {provider: set() for provider in BRIDGE_PROVIDERS}
     bridge_connecting = {provider: False for provider in BRIDGE_PROVIDERS}
+    project_operators = {}
     pool = None
 
     async def database_context(_app):
@@ -413,19 +455,28 @@ def create_app():
             values = validate_register(data)
         except ValueError as exc:
             return failure(str(exc), 422)
+        webhook_url = values.pop("webhook_url", None)
+        webhook_secret = secrets.token_urlsafe(32) if webhook_url else None
         try:
-            token, project_id = await register_user(pool, **values)
+            token, project_id = await register_user(
+                pool, webhook_url=webhook_url, webhook_secret=webhook_secret,
+                **values,
+            )
         except IntegrityError as exc:
             if exc.args and exc.args[0] == 1062:
                 return failure("Registration conflicted. Try again.", 409)
             raise
+        result = {
+            "status": True,
+            "token": token,
+            "project_id": project_id,
+            "client_key": derive_client_key(token),
+        }
+        if webhook_secret:
+            result["webhook_url"] = webhook_url
+            result["webhook_secret"] = webhook_secret
         return web.json_response(
-            {
-                "status": True,
-                "token": token,
-                "project_id": project_id,
-                "client_key": derive_client_key(token),
-            },
+            result,
             status=201,
             headers={"Cache-Control": "no-store"},
         )
@@ -543,6 +594,50 @@ def create_app():
             headers={"Cache-Control": "no-store"},
         )
 
+    async def set_webhook(request):
+        project_id, error = await require_project(request)
+        if error:
+            return error
+        target = parse_path_id(request.match_info["project_id"])
+        if target is None:
+            return failure("Invalid project_id.", 422)
+        if target != project_id:
+            return failure("Project does not match token.", 403)
+        try:
+            data = await request.json()
+        except (ValueError, TypeError):
+            return failure("Invalid JSON.", 400)
+        if not isinstance(data, dict) or set(data) != {"webhook_url"}:
+            return failure("Provide webhook_url.", 422)
+        try:
+            url = validate_webhook_url(data["webhook_url"])
+        except ValueError as exc:
+            return failure(str(exc), 422)
+        secret = secrets.token_urlsafe(32)
+        if not await set_project_webhook(pool, project_id, url, secret):
+            return failure("Project not found.", 404)
+        return web.json_response(
+            {
+                "status": True,
+                "webhook_url": url,
+                "webhook_secret": secret,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def remove_webhook(request):
+        project_id, error = await require_project(request)
+        if error:
+            return error
+        target = parse_path_id(request.match_info["project_id"])
+        if target is None:
+            return failure("Invalid project_id.", 422)
+        if target != project_id:
+            return failure("Project does not match token.", 403)
+        if not await delete_project_webhook(pool, project_id):
+            return failure("Project not found.", 404)
+        return web.json_response({"status": True})
+
     async def client_key(request):
         project_id, error = await require_project(request)
         if error:
@@ -621,6 +716,8 @@ def create_app():
     app.router.add_patch("/api/users/me", edit_user)
     app.router.add_patch("/api/projects/{project_id}", edit_project)
     app.router.add_post("/api/projects/{project_id}/token", rotate_token)
+    app.router.add_post("/api/projects/{project_id}/webhook", set_webhook)
+    app.router.add_delete("/api/projects/{project_id}/webhook", remove_webhook)
     app.router.add_get("/api/projects/{project_id}/client-key", client_key)
     app.router.add_post("/api/sources", add_source)
     app.router.add_patch("/api/sources/{source_id}", edit_source)
@@ -632,6 +729,33 @@ def create_app():
     async def emit_project(project_id, event, *args):
         # Only authenticated operators belong to the project room.
         await sio.emit(event, args, room=room(project_id))
+
+    async def deliver_inbound(project_id, payload, *, chat_id=None,
+                              delivery_id=None, echo_room=None):
+        """Route a customer message to live operators or to Planet's webhook."""
+        if project_operators.get(project_id):
+            await emit_project(project_id, "chat", payload)
+            if echo_room is not None:
+                await sio.emit("chat", payload, room=echo_room)
+            return
+
+        if chat_id is None:
+            chat_id = payload["user_id"]
+        webhook = await get_project_webhook(pool, project_id)
+        if not webhook:
+            raise StoreOffline("Store is offline and no webhook is configured.")
+        url, secret = webhook
+        if delivery_id is None:
+            delivery_id = delivery_id_for(payload, chat_id)
+        try:
+            await deliver_webhook(
+                url, secret, project_id, payload, chat_id, delivery_id
+            )
+        except WebhookError as exc:
+            # Keep the URL and secret out of the client-facing error.
+            raise WebhookDeliveryError(
+                "Store is offline and the project webhook failed."
+            ) from exc
 
     async def emit_source(name, robot_id, event, *args):
         # Entry point for future provider adapters, not a public endpoint.
@@ -646,11 +770,16 @@ def create_app():
         project_id = await find_source_project(pool, name, payload["robot_id"])
         if project_id is None:
             return False
-        await emit_project(project_id, "chat", payload)
-        await sio.emit(
-            "chat", payload,
-            room=client_room(project_id, name, payload["robot_id"], payload["user_id"]),
-        )
+        try:
+            await deliver_inbound(
+                project_id, payload,
+                chat_id=payload["user_id"],
+                echo_room=client_room(
+                    project_id, name, payload["robot_id"], payload["user_id"]
+                ),
+            )
+        except WebhookError:
+            return False
         return True
 
     @sio.event
@@ -664,7 +793,14 @@ def create_app():
                 return False
             await sio.save_session(sid, {"role": role, "project_id": project_id})
             await sio.enter_room(sid, room(project_id))
-            await sio.emit("authenticated", {"role": role, "project_id": project_id}, to=sid)
+            project_operators.setdefault(project_id, set()).add(sid)
+            try:
+                await sio.emit(
+                    "authenticated", {"role": role, "project_id": project_id}, to=sid
+                )
+            except BaseException:
+                project_operators[project_id].discard(sid)
+                raise
         elif role == "client":
             robot_id = normalize_id(auth.get("robot_id"))
             user_id = normalize_id(auth.get("user_id"))
@@ -722,9 +858,15 @@ def create_app():
             if sid in sids:
                 sids.discard(sid)
                 message_limiter.clear(("bridge", provider))
+        for sids in project_operators.values():
+            sids.discard(sid)
+        for project_id in [p for p, sids in project_operators.items() if not sids]:
+            project_operators.pop(project_id, None)
 
-    async def chat_failure(sid, message):
+    async def chat_failure(sid, message, code=None):
         result = {"status": False, "message": message}
+        if code is not None:
+            result["code"] = code
         await sio.emit("chat_error", result, to=sid)
         return result
 
@@ -754,8 +896,14 @@ def create_app():
             window = MESSAGE_WINDOW
         if not message_limiter.allow(limit_key, limit, window):
             return await chat_failure(sid, "Too many messages. Please slow down.")
-        if len(args) != 1:
-            return await chat_failure(sid, "Expected one message object.")
+        if role == "bridge":
+            if len(args) not in (1, 2):
+                return await chat_failure(
+                    sid, "Expected one message object and optional transport metadata."
+                )
+        else:
+            if len(args) != 1:
+                return await chat_failure(sid, "Expected one message object.")
 
         expected_sender = "client" if role == "bridge" else role
         try:
@@ -776,19 +924,46 @@ def create_app():
                 return await chat_failure(sid, "Bridge cannot send this source.")
             if source_project is None:
                 return await chat_failure(sid, "Source not found.")
-            await emit_project(source_project, "chat", payload)
+            try:
+                chat_id, delivery_id, update_id = parse_bridge_metadata(
+                    args[1] if len(args) == 2 else None, user_id
+                )
+            except ValueError as exc:
+                return await chat_failure(sid, str(exc))
+            if delivery_id is None:
+                delivery_id = delivery_id_for(payload, chat_id, update_id)
+            try:
+                await deliver_inbound(
+                    source_project, payload,
+                    chat_id=chat_id, delivery_id=delivery_id,
+                )
+            except StoreOffline as exc:
+                return await chat_failure(sid, str(exc), code=exc.code)
+            except WebhookDeliveryError as exc:
+                return await chat_failure(sid, str(exc), code=exc.code)
             return {"status": True}
 
         if source_project != project_id:
             return await chat_failure(sid, "Source not found in project.")
 
         if source == "chat":
-            # Echo to the project's operators and the target conversation only.
-            await emit_project(project_id, "chat", payload)
-            await sio.emit(
-                "chat", payload,
-                room=client_room(project_id, source, robot_id, user_id),
-            )
+            if role == "operator":
+                # Operators see the reply and the target client receives it.
+                await emit_project(project_id, "chat", payload)
+                await sio.emit(
+                    "chat", payload,
+                    room=client_room(project_id, source, robot_id, user_id),
+                )
+                return {"status": True}
+            try:
+                await deliver_inbound(
+                    project_id, payload, chat_id=user_id,
+                    echo_room=client_room(project_id, source, robot_id, user_id),
+                )
+            except StoreOffline as exc:
+                return await chat_failure(sid, str(exc), code=exc.code)
+            except WebhookDeliveryError as exc:
+                return await chat_failure(sid, str(exc), code=exc.code)
             return {"status": True}
 
         if source not in BRIDGE_PROVIDERS:

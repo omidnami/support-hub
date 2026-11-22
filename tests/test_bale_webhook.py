@@ -8,7 +8,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from bale_service.api import BaleError
 from bale_service.config import BaleServiceConfig
-from bale_service.hub import HubUnavailable
+from bale_service.hub import HubRejected, HubUnavailable
 from bale_service.repository import BaleSource
 from bale_service.service import BaleService, OutboundDispatcher
 
@@ -67,11 +67,13 @@ class FakeHub:
         self.connected = connected
         self.error = error
         self.sent = []
+        self.metadata = []
 
-    async def send_inbound(self, payload):
+    async def send_inbound(self, payload, metadata=None):
         if self.error:
             raise self.error
         self.sent.append(payload)
+        self.metadata.append(metadata)
 
     async def close(self):
         pass
@@ -177,6 +179,9 @@ class BaleWebhookTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(hub.sent), 1)
         self.assertEqual(hub.sent[0]["user_id"], "42")
         self.assertEqual(hub.sent[0]["source"], "bale")
+        self.assertEqual(
+            hub.metadata, [{"update_id": 10, "chat_id": "42"}]
+        )
         advance.assert_awaited_once_with(service.pool, source.id, 10)
 
     async def test_duplicate_update_is_acknowledged_without_forwarding(self):
@@ -239,6 +244,21 @@ class BaleWebhookTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch(
             "bale_service.service.find_source_by_secret",
             new=mock.AsyncMock(return_value=source),
+        ), mock.patch(
+            "bale_service.service.advance_last_update_id",
+            new=mock.AsyncMock(return_value=True),
+        ) as advance:
+            status, _ = await self.post(service, make_update())
+        self.assertEqual(status, 503)
+        advance.assert_not_awaited()
+
+    async def test_hub_rejection_is_temporary_and_does_not_advance(self):
+        service = self.make_service(
+            FakeHub(error=HubRejected("Store is offline and no webhook is configured."))
+        )
+        with mock.patch(
+            "bale_service.service.find_source_by_secret",
+            new=mock.AsyncMock(return_value=make_source()),
         ), mock.patch(
             "bale_service.service.advance_last_update_id",
             new=mock.AsyncMock(return_value=True),

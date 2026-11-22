@@ -1,11 +1,15 @@
 import unittest
 
-from database import update_source_token
+from database import (
+    delete_project_webhook, get_project_webhook, set_project_webhook,
+    update_source_token,
+)
 
 
 class _Cursor:
-    def __init__(self, row):
+    def __init__(self, row, rowcount=1):
         self.row = row
+        self.rowcount = rowcount
         self.queries = []
 
     async def __aenter__(self):
@@ -90,6 +94,38 @@ class SourceTokenUpdateTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(connection.committed)
         self.assertEqual(connection.rollbacks, 1)
         self.assertEqual(len(cursor.queries), 1)
+
+
+class ProjectWebhookTests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_project_webhook(self):
+        cursor = _Cursor(("https://planet.example.ir/hook", "secret"))
+        webhook = await get_project_webhook(_Pool(_Connection(cursor)), 2)
+        self.assertEqual(webhook, ("https://planet.example.ir/hook", "secret"))
+
+    async def test_get_project_webhook_returns_none_when_missing(self):
+        for row in (None, (None, None), ("https://planet.example.ir/hook", None)):
+            with self.subTest(row=row):
+                cursor = _Cursor(row)
+                webhook = await get_project_webhook(_Pool(_Connection(cursor)), 2)
+                self.assertIsNone(webhook)
+
+    async def test_set_project_webhook_reports_missing_project(self):
+        cursor = _Cursor(None, rowcount=0)
+        updated = await set_project_webhook(
+            _Pool(_Connection(cursor)), 2, "https://planet.example.ir/hook", "secret"
+        )
+        self.assertFalse(updated)
+        self.assertIn("webhook_url", cursor.queries[0][0])
+
+    async def test_delete_project_webhook_checks_project_existence(self):
+        cursor = _Cursor((2,), rowcount=0)
+        deleted = await delete_project_webhook(_Pool(_Connection(cursor)), 2)
+        self.assertTrue(deleted)
+        self.assertEqual(len(cursor.queries), 2)
+
+        cursor = _Cursor(None, rowcount=0)
+        deleted = await delete_project_webhook(_Pool(_Connection(cursor)), 2)
+        self.assertFalse(deleted)
 
 
 if __name__ == "__main__":

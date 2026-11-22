@@ -48,9 +48,13 @@ def _decode_token(value):
 
 
 async def register_user(pool, name, email, phone, password, project_name,
-                        domain=None, description=None):
+                        domain=None, description=None, webhook_url=None,
+                        webhook_secret=None):
+    if webhook_url and not webhook_secret:
+        raise ValueError("A webhook secret is required with a webhook URL.")
     token = secrets.token_hex(16)
     password_hash = await asyncio.to_thread(hash_password, password)
+    updated_at = "CURRENT_TIMESTAMP" if webhook_url else "NULL"
     async with pool.acquire() as conn:
         await conn.begin()
         try:
@@ -61,9 +65,11 @@ async def register_user(pool, name, email, phone, password, project_name,
                 )
                 user_id = cursor.lastrowid
                 await cursor.execute(
-                    "INSERT INTO projects (user_id, name, domain, description, token) "
-                    "VALUES (%s, %s, %s, %s, %s)",
-                    (user_id, project_name, domain, description, token),
+                    "INSERT INTO projects (user_id, name, domain, description, token, "
+                    "webhook_url, webhook_secret, webhook_updated_at) "
+                    f"VALUES (%s, %s, %s, %s, %s, %s, %s, {updated_at})",
+                    (user_id, project_name, domain, description, token,
+                     webhook_url, webhook_secret),
                 )
                 project_id = cursor.lastrowid
             await conn.commit()
@@ -117,6 +123,44 @@ async def rotate_project_token(pool, project_id):
                 continue
             raise
     raise RuntimeError("Could not generate a unique project token.")
+
+
+async def get_project_webhook(pool, project_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT webhook_url, webhook_secret FROM projects WHERE id = %s",
+                (project_id,),
+            )
+            row = await cursor.fetchone()
+            if not row or not row[0] or not row[1]:
+                return None
+            return _decode_token(row[0]), _decode_token(row[1])
+
+
+async def set_project_webhook(pool, project_id, url, secret):
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE projects SET webhook_url = %s, webhook_secret = %s, "
+                "webhook_updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+                (url, secret, project_id),
+            )
+            return bool(cursor.rowcount)
+
+
+async def delete_project_webhook(pool, project_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE projects SET webhook_url = NULL, webhook_secret = NULL, "
+                "webhook_updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+                (project_id,),
+            )
+            if cursor.rowcount:
+                return True
+            await cursor.execute("SELECT id FROM projects WHERE id = %s", (project_id,))
+            return bool(await cursor.fetchone())
 
 
 async def find_source_project(pool, name, robot_id):

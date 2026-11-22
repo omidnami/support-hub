@@ -50,6 +50,8 @@ PROJECT_TOKEN = "project-token"
 ROBOT_ID = "my-shop-chat"
 BALE_ROBOT_ID = "bale-bot"
 BALE_SERVICE_TOKEN = "bale-service-token-for-tests"
+WEBHOOK_URL = "https://planet.example.ir/hooks/hub"
+WEBHOOK_SECRET = "w" * 43
 
 
 async def _open_database():
@@ -58,6 +60,10 @@ async def _open_database():
 
 async def _authenticate_project(pool, token):
     return 1 if token == PROJECT_TOKEN else None
+
+
+async def _get_project_webhook(pool, project_id):
+    return (WEBHOOK_URL, WEBHOOK_SECRET) if project_id == 1 else None
 
 
 async def _find_source_project(pool, name, robot_id):
@@ -90,13 +96,21 @@ class SocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
             name: getattr(server, name)
             for name in (
                 "open_database", "authenticate_project", "find_source_project",
-                "find_source_project_with_token",
+                "find_source_project_with_token", "get_project_webhook",
+                "deliver_webhook",
             )
         }
         server.open_database = _open_database
         server.authenticate_project = _authenticate_project
         server.find_source_project = _find_source_project
         server.find_source_project_with_token = _find_source_project_with_token
+        server.get_project_webhook = _get_project_webhook
+        self.webhook_calls = []
+
+        async def _deliver_webhook(*args):
+            self.webhook_calls.append(args)
+
+        server.deliver_webhook = _deliver_webhook
         self.env_patch = mock.patch.dict(
             os.environ, {"HUB_BALE_SERVICE_TOKEN": BALE_SERVICE_TOKEN}
         )
@@ -211,6 +225,7 @@ class SocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(client_message.wait(), timeout=2)
         self.assertEqual(received["operator"], payload)
         self.assertEqual(received["client"], payload)
+        self.assertEqual(self.webhook_calls, [])
 
     async def test_client_cannot_use_another_users_signature(self):
         expires = int(time.time()) + 300
@@ -262,6 +277,93 @@ class SocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(received.wait(), timeout=2)
         self.assertEqual(ack, {"status": True})
         self.assertEqual(messages, [payload])
+
+    async def test_bale_bridge_inbound_without_operator_uses_webhook(self):
+        bridge = await self.connect_bridge()
+        payload = bale_payload()
+        ack = await bridge.call(
+            "chat", (payload, {"update_id": 10, "chat_id": "501"})
+        )
+        self.assertEqual(ack, {"status": True})
+        self.assertEqual(len(self.webhook_calls), 1)
+        url, secret, project_id, message, chat_id, delivery_id = self.webhook_calls[0]
+        self.assertEqual(url, WEBHOOK_URL)
+        self.assertEqual(secret, WEBHOOK_SECRET)
+        self.assertEqual(project_id, 1)
+        self.assertEqual(message, payload)
+        self.assertEqual(chat_id, "501")
+        self.assertEqual(delivery_id, "bale:bale-bot:10")
+
+    async def test_bale_bridge_inbound_with_operator_skips_webhook(self):
+        operator = await self.connect_operator()
+        bridge = await self.connect_bridge()
+        received = asyncio.Event()
+
+        @operator.on("chat")
+        async def on_chat(_data):
+            received.set()
+
+        ack = await bridge.call("chat", bale_payload())
+        await asyncio.wait_for(received.wait(), timeout=2)
+        self.assertEqual(ack, {"status": True})
+        self.assertEqual(self.webhook_calls, [])
+
+    async def test_offline_bridge_without_webhook_is_rejected(self):
+        bridge = await self.connect_bridge()
+        server.get_project_webhook = mock.AsyncMock(return_value=None)
+        ack = await bridge.call("chat", bale_payload())
+        self.assertEqual(
+            ack,
+            {
+                "status": False,
+                "message": "Store is offline and no webhook is configured.",
+                "code": "store_offline",
+            },
+        )
+
+    async def test_offline_webhook_failure_is_rejected(self):
+        bridge = await self.connect_bridge()
+
+        async def _failed_delivery(*_args):
+            raise server.WebhookDeliveryError("boom")
+
+        server.deliver_webhook = _failed_delivery
+        ack = await bridge.call("chat", bale_payload())
+        self.assertEqual(
+            ack,
+            {
+                "status": False,
+                "message": "Store is offline and the project webhook failed.",
+                "code": "webhook_failed",
+            },
+        )
+
+    async def test_internal_client_without_operator_uses_webhook(self):
+        client = await self.connect_client(user_id="101")
+        payload = {
+            "user_id": "101",
+            "sender": "client",
+            "text": "hello",
+            "file": None,
+            "robot_id": ROBOT_ID,
+            "timestamp": 1794841200000,
+            "source": "chat",
+        }
+        ack = await client.call("chat", payload)
+        self.assertEqual(ack, {"status": True})
+        self.assertEqual(len(self.webhook_calls), 1)
+        self.assertEqual(self.webhook_calls[0][4], "101")
+        self.assertTrue(self.webhook_calls[0][5].startswith("msg:"))
+
+    async def test_bridge_transport_can_override_identity_metadata(self):
+        bridge = await self.connect_bridge()
+        ack = await bridge.call(
+            "chat",
+            (bale_payload(), {"chat_id": "chat-7", "delivery_id": "delivery-7"}),
+        )
+        self.assertEqual(ack, {"status": True})
+        self.assertEqual(self.webhook_calls[0][4], "chat-7")
+        self.assertEqual(self.webhook_calls[0][5], "delivery-7")
 
     async def test_operator_bale_reply_reaches_bridge(self):
         operator = await self.connect_operator()

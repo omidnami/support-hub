@@ -11,8 +11,11 @@ class FakeClient:
         self.error = None
         self.calls = []
 
-    async def call(self, event, data, timeout=None):
-        self.calls.append((event, data, timeout))
+    async def call(self, event, data, *args, timeout=None):
+        if isinstance(data, tuple):
+            self.calls.append((event, *data, timeout))
+        else:
+            self.calls.append((event, data, timeout))
         if self.error is not None:
             raise self.error
         return self.result
@@ -47,6 +50,17 @@ class HubBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             bridge.client.calls,
             [("chat", payload, 3)],
+        )
+
+    async def test_transport_metadata_is_forwarded_separately(self):
+        bridge = make_bridge()
+        payload = {"text": "hello"}
+        metadata = {"update_id": 10, "chat_id": "501"}
+        ack = await bridge.send_inbound(payload, metadata)
+        self.assertEqual(ack, {"status": True})
+        self.assertEqual(
+            bridge.client.calls,
+            [("chat", payload, metadata, 3)],
         )
 
     async def test_rejected_inbound_raises_with_the_hub_message(self):

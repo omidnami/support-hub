@@ -107,11 +107,16 @@ class HubBridge:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30)
 
-    async def send_inbound(self, payload):
+    async def send_inbound(self, payload, metadata=None):
         if not self.connected:
             raise HubUnavailable("Hub bridge is disconnected.")
         try:
-            ack = await self.client.call("chat", payload, timeout=self.ack_timeout)
+            if metadata is None:
+                ack = await self.client.call("chat", payload, timeout=self.ack_timeout)
+            else:
+                ack = await self.client.call(
+                    "chat", (payload, metadata), timeout=self.ack_timeout
+                )
         except asyncio.TimeoutError as exc:
             raise HubUnavailable("Hub did not acknowledge the message.") from exc
         except Exception as exc:

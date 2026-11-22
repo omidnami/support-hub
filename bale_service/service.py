@@ -317,7 +317,10 @@ class BaleService:
                 await advance_last_update_id(self.pool, source.id, update_id)
                 return "ignored"
 
-            await self.hub.send_inbound(payload)
+            await self.hub.send_inbound(
+                payload,
+                {"update_id": update_id, "chat_id": payload["user_id"]},
+            )
             if not await advance_last_update_id(self.pool, source.id, update_id):
                 logger.warning(
                     "Bale update %s for source %s was forwarded but the dedup cursor "

@@ -18,6 +18,7 @@ from server import (
     derive_client_key,
     message_payload,
     normalize_id,
+    parse_bridge_metadata,
     parse_patch_values,
     parse_path_id,
     validate_register,
@@ -126,6 +127,26 @@ class RegistrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid field: name"):
             validate_register(data)
 
+    def test_webhook_url_is_optional_and_validated(self):
+        data = valid_registration()
+        data["webhook_url"] = "https://planet.example.ir/hooks/hub"
+        with mock.patch.dict(
+            os.environ,
+            {"HUB_WEBHOOK_ALLOW_HTTP": "0", "HUB_WEBHOOK_ALLOW_PRIVATE": "0"},
+        ):
+            self.assertEqual(
+                validate_register(data)["webhook_url"], data["webhook_url"]
+            )
+        data["webhook_url"] = "http://planet.example.ir/hooks/hub"
+        with mock.patch.dict(
+            os.environ,
+            {"HUB_WEBHOOK_ALLOW_HTTP": "0", "HUB_WEBHOOK_ALLOW_PRIVATE": "0"},
+        ):
+            with self.assertRaisesRegex(ValueError, "webhook_url"):
+                validate_register(data)
+        data["webhook_url"] = "   "
+        self.assertIsNone(validate_register(data)["webhook_url"])
+
 
 class PatchTests(unittest.TestCase):
     def test_user_patch(self):
@@ -185,6 +206,36 @@ class IdentifierTests(unittest.TestCase):
         self.assertIsNone(parse_path_id("-1"))
         self.assertIsNone(parse_path_id("1.0"))
         self.assertIsNone(parse_path_id("١"))
+
+
+class BridgeMetadataTests(unittest.TestCase):
+    def test_defaults_to_the_message_user_id(self):
+        self.assertEqual(
+            parse_bridge_metadata(None, "501"), ("501", None, None)
+        )
+
+    def test_parses_update_id_chat_id_and_delivery_id(self):
+        self.assertEqual(
+            parse_bridge_metadata(
+                {"update_id": 10, "chat_id": "501", "delivery_id": "d-1"},
+                "default",
+            ),
+            ("501", "d-1", 10),
+        )
+
+    def test_rejects_invalid_metadata(self):
+        for metadata in (
+            {"unknown": 1},
+            {"update_id": True},
+            {"update_id": -1},
+            {"chat_id": ""},
+            {"chat_id": "a\nb"},
+            {"delivery_id": "bad\nid"},
+            "not-a-dict",
+        ):
+            with self.subTest(metadata=metadata):
+                with self.assertRaises(ValueError):
+                    parse_bridge_metadata(metadata, "501")
 
 
 class ClientSignatureTests(unittest.TestCase):

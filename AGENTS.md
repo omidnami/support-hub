@@ -2,7 +2,7 @@
 
 > حافظه پروژه برای مدل‌ها و ایجنت‌ها. پیش از هر تغییر این فایل را بخوانید و اگر تصمیم معماری، قرارداد یا محدودیت عملیاتی تغییر کرد، همین فایل را هم به‌روزرسانی کنید.
 
-**Last verified:** 2026-11-21 · base implementation commit `8f99611` · 115 tests passing (docs may be newer)
+**Last verified:** 2026-11-22 · base implementation commit `e13d931` · 151 tests passing (docs may be newer)
 
 ---
 
@@ -36,7 +36,8 @@ Non-goals for now: group/channel chats, durable queues, message history in Hub, 
 9. **Webhook secret is the only Bale authentication.** Never log it, never return it in public APIs, and mask it in proxy logs.
 10. **Do not commit `.env`, bot tokens, project tokens, or webhook secrets.**
 11. **Keep changes consistent with existing style.** Run the full test suite and compile step before finishing.
-12. **Do not commit unless the user explicitly asks.** (Current work was committed externally as `8f99611`; keep future changes uncommitted by default.)
+12. **Do not commit unless the user explicitly asks.** (Earlier work was committed externally; keep future changes uncommitted by default.)
+13. **Do not silently ACK offline inbound.** If the project room has no operator, Hub sends a signed project webhook to Planet and only ACKs on `2xx`. If the webhook is missing or fails, the inbound message is rejected (`store_offline` / `webhook_failed`). Hub still stores no message or queue.
 
 ---
 
@@ -48,6 +49,8 @@ Planet / operator frontend
         ▼
    Support Hub  ──────────────  project:{project_id} room
         │  bridge:bale room
+        │
+        ├── signed HTTPS webhook (offline fallback) ──►  Planet ingest
         ▼
    bale_service  ────────────►  Bale Bot API
         ▲
@@ -67,9 +70,10 @@ Hub emits `authenticated` after successful auth. Chat failures emit `chat_error`
 
 ### Event flow
 
-- **Internal inbound:** client → Hub → `project:{id}` + conversation room.
+- **Internal inbound:** client → Hub → `project:{id}` + conversation room when an operator is online.
 - **Internal outbound:** operator → Hub → `project:{id}` + conversation room.
-- **Bale inbound:** `bale_service` → Hub as `sender=client` → `project:{id}`.
+- **Bale inbound:** `bale_service` → Hub as `sender=client` → `project:{id}` or the project webhook when the room is empty.
+- **Offline inbound:** if `project:{id}` has no operator socket, Hub POSTs the signed seven-field message to the project's Planet webhook; only a `2xx` permits the ACK. Without a webhook or on failure, the sender gets `store_offline` / `webhook_failed` and Bale returns `503`.
 - **Bale outbound:** operator → Hub as `sender=operator` → `bridge:bale` → `bale_service` → Bale.
 - If the Bale bridge is offline, Hub returns `chat_error` and does **not** echo the reply as delivered.
 
@@ -106,6 +110,8 @@ Bale inbound always sets:
 - `robot_id`: registered bot ID
 - `timestamp`: `message.date * 1000`, falling back to current time
 - `file`: compact metadata only (`provider`, `type`, `file_id`, and optional bounded fields)
+
+`chat_id` and `conversation_key` are transport metadata, **not** eighth message fields. `chat_id` is the platform conversation ID (Bale: `message.chat.id`; internal chat: signed `user_id`; future adapters: chat/thread ID). `conversation_key = (project_id, source, robot_id, chat_id)`.
 
 ---
 
@@ -191,16 +197,32 @@ operator reply → Hub → bridge:bale → bale_service per-bot queue
 - Update IDs are per bot. When a source token/robot changes, **clear `webhook_secret` and `last_update_id`** so old-bot state cannot leak into the new bot.
 - `bale_service` handles only `message` updates; edits, callbacks, etc. are intentionally ignored in phase one.
 
+### Offline fallback webhook (implemented)
+
+- Per-project webhook in Planet; same rule for Bale, internal chat, Rubika, and future adapters.
+- Hub checks whether `project:{id}` has any `operator` socket. If yes, current live emit; if no, Hub POSTs a signed webhook and only ACKs on `2xx`.
+- Hub tracks operator presence in memory per project SID set; single-instance only. Client and bridge sockets do not count as operators.
+- Hub stores no message or queue. Missing webhook returns `store_offline`; delivery failure returns `webhook_failed`; Bale returns `503` and does not advance `last_update_id`.
+- URL/secret live in `projects` (`webhook_url`, `webhook_secret`, `webhook_updated_at`, migration `004`), not in a new table.
+- `POST /api/register` accepts an optional `webhook_url`; Hub generates the secret and returns `webhook_url` + `webhook_secret` only once. `POST`/`DELETE /api/projects/{id}/webhook` set/rotate or remove it.
+- URL must be HTTPS by default, reject credentials/fragments/private hosts, and use a per-project HMAC secret. Delivery re-resolves DNS; redirects are not followed.
+- Payload keeps the seven-field message unchanged; `project_id`, `conversation`, `chat_id`, `delivery_id`, and `event` are transport metadata.
+- Headers: `X-Hub-Event`, `X-Hub-Delivery`, `X-Hub-Timestamp`, `X-Hub-Signature-256` = `HMAC-SHA256(secret, timestamp + "." + raw_body)`.
+- `chat_id` mapping: Bale `message.chat.id`; internal chat `user_id`; future adapters chat/thread ID. The Bale bridge sends optional `{update_id, chat_id}` as a second Socket.IO argument.
+- `delivery_id` is `source:robot_id:update_id` for Bale and a stable hash otherwise. Planet must be idempotent; an ACK lost after a successful write can cause a duplicate.
+- Offline-only webhook does not give Planet a complete history for messages seen live by operators. If Planet must be a full system of record, ingest every inbound message, not only offline ones.
+- Internal-chat customer offline is still unsolved: storing the inbound message does not deliver the later operator reply to a disconnected client.
+
 ---
 
 ## 6. Database
 
-Migration order: `migrations/001_initial.sql`, `002_add_source_token.sql`, `003_add_bale_webhook_metadata.sql`.
+Migration order: `migrations/001_initial.sql`, `002_add_source_token.sql`, `003_add_bale_webhook_metadata.sql`, `004_add_project_webhook.sql`.
 
 Core tables:
 
 - `users`: id, name, email, phone, password.
-- `projects`: id, user_id, name, domain, description, token (unique).
+- `projects`: id, user_id, name, domain, description, token (unique), `webhook_url`, `webhook_secret`, `webhook_updated_at`.
 - `sources`: id, name enum, robot_id, project_id, token, webhook_secret, last_update_id.
   - unique `(name, robot_id)`
   - unique `webhook_secret`
@@ -210,6 +232,7 @@ Important behavior:
 
 - `database.py` migrates an existing database; it does **not** create the database or DB user.
 - `database.open_database()` uses `autocommit=True`.
+- Hub never stores message content, history, or an offline queue. Project webhook metadata is the only addition.
 - `update_source_token()` runs in an explicit transaction, locks the row with `SELECT ... FOR UPDATE`, and when token/robot changes, clears `webhook_secret` and `last_update_id` atomically.
 - Source tokens are stored as plaintext. DB/backup security is the installer's responsibility.
 - `webhook_secret` and `last_update_id` are **transport metadata**, not message history.
@@ -226,8 +249,9 @@ Run migrations:
 
 | Path | Responsibility |
 | --- | --- |
-| `server.py` | Hub REST API + Socket.IO auth, rooms, routing, rate limits, bridge support |
-| `database.py` | DB pool, migrations, queries, source token update transaction |
+| `server.py` | Hub REST API + Socket.IO auth, rooms, routing, operator presence, rate limits, bridge support |
+| `database.py` | DB pool, migrations, project webhook queries, source token update transaction |
+| `webhooks.py` | Webhook URL validation, signed offline payload, delivery ID, HMAC delivery |
 | `config.py` | `.env` loading, env flags |
 | `bale_service/service.py` | Lifecycle, webhook handler, source sync, dedup, health, outbound dispatcher |
 | `bale_service/api.py` | Bale Bot API client, webhook registration, text/caption splitting, send |
@@ -236,6 +260,7 @@ Run migrations:
 | `bale_service/repository.py` | Bale source queries, secret generation, dedup cursor updates |
 | `bale_service/config.py` | Bale env validation (HTTPS/port/token) |
 | `migrations/003_add_bale_webhook_metadata.sql` | `webhook_secret`, `last_update_id`, unique index |
+| `migrations/004_add_project_webhook.sql` | project `webhook_url`, `webhook_secret`, `webhook_updated_at` |
 | `docs/architecture.md` | Human-facing Persian architecture document |
 | `README.md` | Public Persian API/setup/Bale runbook |
 | `tests/` | Unit + mocked HTTP/Socket.IO integration tests |
@@ -257,7 +282,13 @@ HUB_PORT=8765
 HUB_TRUST_PROXY=0
 HUB_LOG_LEVEL=INFO
 HUB_BALE_SERVICE_TOKEN=<long-random-shared-secret>
+HUB_WEBHOOK_ALLOW_HTTP=0
+HUB_WEBHOOK_ALLOW_PRIVATE=0
+HUB_WEBHOOK_TIMEOUT=5
 ```
+
+- `HUB_WEBHOOK_ALLOW_HTTP` and `HUB_WEBHOOK_ALLOW_PRIVATE` are development-only. Both must be `0` in production.
+- `HUB_WEBHOOK_TIMEOUT` is seconds (default 5, capped at 30).
 
 Bale service:
 
@@ -318,7 +349,7 @@ Bale health returns `database`, `hub_connected`, and `sources`; it returns HTTP 
 Compile and test:
 
 ```bash
-.venv/bin/python -m compileall -q server.py database.py config.py bale_service
+.venv/bin/python -m compileall -q server.py database.py config.py webhooks.py bale_service
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
@@ -342,22 +373,32 @@ Verified:
 
 The E2E script is **not committed** because it needs a real database and process orchestration. Reproduce it manually when changing the bridge/webhook path.
 
+A second offline-webhook E2E was run with real MariaDB, a real Hub `TestServer`, a local HTTP webhook receiver, and a real Socket.IO bridge/operator. Verified:
+
+1. Registration with `webhook_url` stored the URL and returned a secret once.
+2. With no operator, bridge inbound produced a signed `chat.offline` POST with matching HMAC and `delivery_id=bale:<robot>:<update_id>`.
+3. With an operator connected, the message reached the operator and no webhook was sent.
+4. After deleting the webhook and disconnecting the operator, bridge inbound was rejected with `store_offline` and no cursor advance.
+
+That smoke script is also uncommitted; the durable coverage is in `tests/test_webhooks.py` and `tests/test_socket_integration.py`.
+
 ---
 
 ## 10. Test map
 
 | File | Covers |
 | --- | --- |
-| `tests/test_helpers.py` | identifiers, payload validation, rate limiter, config |
-| `tests/test_http_api.py` | registration, tokens, client key, JSON errors, rate limits |
-| `tests/test_socket_integration.py` | operator/client routing, bridge auth, inbound/outbound, offline bridge, duplicate/concurrent bridge |
+| `tests/test_helpers.py` | identifiers, payload validation, bridge metadata, rate limiter, config |
+| `tests/test_http_api.py` | registration, webhook registration/set/delete, tokens, client key, JSON errors, rate limits |
+| `tests/test_socket_integration.py` | operator/client routing, bridge auth, inbound/outbound, offline webhook fallback, bridge metadata, duplicate/concurrent bridge |
 | `tests/test_bale_mapping.py` | Bale update mapping, text/file metadata, splitting, file references |
 | `tests/test_bale_api.py` | `setWebhook`, sendMessage/sendPhoto, 429 retry, errors, caption limit |
 | `tests/test_bale_webhook.py` | webhook status codes, dedup, ignored updates, Hub failures, health, sync, token rotation, outbound queue |
 | `tests/test_bale_repository.py` | row decoding, secret generation, dedup cursor SQL |
 | `tests/test_bale_hub.py` | bridge inbound ACK/rejection/timeout, operator event filter |
 | `tests/test_bale_config.py` | required token, HTTPS/port rules, registration disable |
-| `tests/test_database_source.py` | source token transaction, Bale state reset, missing source |
+| `tests/test_database_source.py` | source token transaction, project webhook queries, Bale state reset, missing source |
+| `tests/test_webhooks.py` | URL/SSRF validation, delivery IDs, payload/signature, signed delivery, redirects, timeouts |
 
 **Not in the repo:** integration tests against real MariaDB or the real Bale API. The manual E2E above is the substitute.
 
@@ -365,7 +406,7 @@ The E2E script is **not committed** because it needs a real database and process
 
 ## 11. Operational runbook
 
-1. Apply migration `003` before starting the Bale service.
+1. Apply migrations `003` and `004` before starting Hub / the Bale service.
 2. Set `HUB_BALE_SERVICE_TOKEN` identically in Hub and Bale service.
 3. Set `BALE_PUBLIC_BASE_URL` to a public HTTPS origin on port 443/88.
 4. Reverse proxy only `/webhooks/bale/<secret>` to `BALE_SERVICE_HOST:BALE_SERVICE_PORT`.
@@ -381,7 +422,9 @@ The E2E script is **not committed** because it needs a real database and process
 ## 12. Known limitations and open decisions
 
 - **Planet persistence/offline policy is not confirmed** beyond "Hub stores nothing." Planet must define retry/history behavior.
-- **No durable queue**: if Bale service is down, webhook delivery depends on Bale retries; if Hub is down, webhook returns 503. No Redis/queue yet.
+- **No durable queue**: if Bale service is down, webhook delivery depends on Bale retries; if Hub is down, webhook returns 503. No Redis/queue yet. The signed offline webhook is implemented, but Hub itself has no retry.
+- **Offline-only webhook is not a complete history**: if an operator is online, Planet does not receive the message unless the operator UI also persists it. Ingest all inbound messages if Planet must be the full system of record.
+- **Internal-chat customer offline**: the inbound message can be stored by Planet, but a later operator reply to a disconnected client has no Hub history/backlog path yet.
 - **No final delivery ACK**: ACK means Hub received the message, not that Bale delivered it.
 - **Attachments are metadata only**: no S3/MinIO, no stable download links.
 - **Private Bale chats only**: group/channel support needs a separate sender/conversation model.
@@ -406,6 +449,10 @@ The E2E script is **not committed** because it needs a real database and process
 - **`update_id` is per bot.** Reset it on bot token/robot changes.
 - **Empty file objects** (`{}`, `""`) must be treated as no file, otherwise text-only replies fail.
 - **`sender` on bridge inbound must be `client`.** Hub derives the project from `source + robot_id`, never from the payload.
+- **Offline fallback check is presence-only:** Hub can see whether `project:{id}` has any operator socket, not identity/assignment/count. Any connected operator suppresses the webhook; Planet still owns assignment.
+- **Never ACK offline inbound on an empty room.** Only a successful Planet webhook `2xx` permits the ACK; otherwise Bale must keep its cursor unchanged.
+- **Offline webhook needs SSRF checks, per-project HMAC, and stable `delivery_id`.** Do not log the URL, secret, or message body. Planet must deduplicate retries.
+- **`chat_id` is transport metadata, not an eighth field.** Keep the seven-field payload unchanged; use `conversation_key = (project_id, source, robot_id, chat_id)`.
 - **Operator reply does not create a conversation room for Bale**; `user_id` is the Bale chat ID and the bridge is the only delivery path.
 - **Queue ordering is per bot**, not global. Cross-bot ordering is irrelevant.
 - **429 handling:** one retry only, bounded by `retry_after`; do not loop forever.
@@ -421,6 +468,7 @@ Before finishing any change:
 - [ ] Did I derive project identity from token/source, never payload?
 - [ ] Did I keep bridge/models single-instance assumptions?
 - [ ] Did I avoid logging tokens or webhook secrets?
+- [ ] For offline webhook changes: signed payload, SSRF validation, idempotency key, `chat_id` metadata, and no ACK before Planet `2xx`?
 - [ ] Did I update `.env.example`, README, `docs/architecture.md`, and this file if behavior changed?
 - [ ] Did I add/update tests for success, rejection, timeout, and duplicate paths?
 - [ ] Did I run `compileall` and the full unittest suite?
@@ -430,10 +478,11 @@ Before finishing any change:
 
 ## 15. Handoff snapshot (2026-11-21)
 
-- Phase one (internal chat + private Bale) is implemented and covered by **115 tests**.
+- Phase one (internal chat + private Bale) plus the offline Planet webhook are implemented and covered by **151 tests**.
 - A manual E2E with real Hub + MariaDB + `bale_service` + fake Bale API passed: webhook registration, inbound relay, dedup, outbound reply.
-- Migration `003` is applied to the local development database.
-- Base code is committed as `8f99611`; documentation updates after that may be uncommitted.
+- Migrations `003` and `004` are applied to the local development database.
+- Base code is committed as `8f99611`; later commits include `e13d931`. Current changes are uncommitted.
 - Local `.env` still needs `HUB_BALE_SERVICE_TOKEN`, `HUB_URL`, and `BALE_PUBLIC_BASE_URL` before the Bale service can run.
 - Real Bale verification is blocked on a real bot token and a public HTTPS endpoint on port 443/88.
-- Next decisions: Planet persistence/offline policy, S3/MinIO attachments, final delivery ACK, and whether to add periodic `getWebhookInfo` verification.
+- The offline Planet webhook is implemented in `webhooks.py`, `server.py`, and `database.py`; docs are updated in `docs/architecture.md` §8 and README §6.
+- Next decisions: Planet persistence/offline policy, whether to ingest all inbound messages or only offline ones, internal-chat offline reply delivery, S3/MinIO attachments, final delivery ACK, and periodic `getWebhookInfo` verification.

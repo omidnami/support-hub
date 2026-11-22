@@ -13,6 +13,7 @@
 - [REST API](#rest-api)
 - [اتصال سوکت](#socket)
 - [سرویس بله](#bale-service)
+- [پیام‌های فروشگاه آفلاین](#offline-webhook)
 - [کدهای وضعیت](#status-codes)
 - [محدوده نسخه فعلی](#scope)
 
@@ -50,6 +51,9 @@ chmod 600 .env
 | `HUB_TRUST_PROXY` | `0` | فقط پشت Reverse Proxy معتبر `1` شود تا محدودیت نرخ IP را از `X-Forwarded-For` بخواند |
 | `HUB_LOG_LEVEL` | `INFO` | سطح لاگ برنامه |
 | `HUB_BALE_SERVICE_TOKEN` | — | توکن مشترک سرویس‌به‌سرویس برای اتصال bridge بله؛ برای اجرای سرویس بله الزامی است و باید در Hub و سرویس بله یکسان باشد |
+| `HUB_WEBHOOK_ALLOW_HTTP` | `0` | فقط برای توسعه محلی؛ با `1` آدرس HTTP هم برای webhook پروژه پذیرفته می‌شود |
+| `HUB_WEBHOOK_ALLOW_PRIVATE` | `0` | فقط برای توسعه محلی؛ با `1` مقصدهای private/loopback هم پذیرفته می‌شوند |
+| `HUB_WEBHOOK_TIMEOUT` | `5` | مهلت تحویل webhook آفلاین در ثانیه (حداکثر ۳۰) |
 | `HUB_URL` | `http://127.0.0.1:8765` | آدرس Hub برای اتصال سرویس بله |
 | `BALE_API_BASE` | `https://tapi.bale.ai` | آدرس API بله |
 | `BALE_PUBLIC_BASE_URL` | `https://support.example.com` | آدرس عمومی HTTPS با پورت 443 یا 88؛ مگر اینکه ثبت webhook با `BALE_DISABLE_WEBHOOK_REGISTRATION=1` غیرفعال شود |
@@ -102,7 +106,7 @@ python server.py
 python -m bale_service
 ```
 
-دستور اول مایگریشن‌ها را به ترتیب روی دیتابیس موجود اجرا می‌کند. اجرای دوباره آن بی‌خطر است، ولی MariaDB برای جدول‌ها و ستون‌های موجود هشدار `already exists` چاپ می‌کند. برای معماری جدید از دیتابیس تازه استفاده کنید؛ این مایگریشن‌ها جداول معماری قدیمی را حذف یا تبدیل نمی‌کنند. مایگریشن `003` دو ستون `webhook_secret` و `last_update_id` و ایندکس یکتای `uq_sources_webhook_secret` را به `sources` اضافه می‌کند.
+دستور اول مایگریشن‌ها را به ترتیب روی دیتابیس موجود اجرا می‌کند. اجرای دوباره آن بی‌خطر است، ولی MariaDB برای جدول‌ها و ستون‌های موجود هشدار `already exists` چاپ می‌کند. برای معماری جدید از دیتابیس تازه استفاده کنید؛ این مایگریشن‌ها جداول معماری قدیمی را حذف یا تبدیل نمی‌کنند. مایگریشن `003` دو ستون `webhook_secret` و `last_update_id` و ایندکس یکتای `uq_sources_webhook_secret` را به `sources` اضافه می‌کند. مایگریشن `004` ستون‌های `webhook_url`، `webhook_secret` و `webhook_updated_at` را برای webhook آفلاین به `projects` اضافه می‌کند.
 
 بررسی سلامت سرویس:
 
@@ -199,6 +203,8 @@ signature = hmac.new(bytes.fromhex(client_key), message, hashlib.sha256).hexdige
 | PATCH | `/api/users/me` | ویرایش مالک پروژه | دارد |
 | PATCH | `/api/projects/{project_id}` | ویرایش پروژه | دارد |
 | POST | `/api/projects/{project_id}/token` | تعویض توکن پروژه | دارد |
+| POST | `/api/projects/{project_id}/webhook` | ثبت یا تعویض webhook پروژه | دارد |
+| DELETE | `/api/projects/{project_id}/webhook` | حذف webhook پروژه | دارد |
 | GET | `/api/projects/{project_id}/client-key` | دریافت کلید امضای کلاینت | دارد |
 | POST | `/api/sources` | ثبت منبع | دارد |
 | PATCH | `/api/sources/{source_id}` | تغییر توکن منبع | دارد |
@@ -219,6 +225,7 @@ signature = hmac.new(bytes.fromhex(client_key), message, hashlib.sha256).hexdige
 | project_name | string | بله | حداکثر 190 |
 | domain | string | خیر | حداکثر 253 |
 | description | string | خیر | حداکثر 16383 |
+| webhook_url | string | خیر | حداکثر 2048، HTTPS |
 
 نمونه درخواست:
 
@@ -243,9 +250,13 @@ curl -X POST 'http://127.0.0.1:8765/api/register' \
   "status": true,
   "token": "PROJECT_TOKEN",
   "project_id": 1,
-  "client_key": "CLIENT_KEY"
+  "client_key": "CLIENT_KEY",
+  "webhook_url": "https://planet.example.ir/hooks/hub",
+  "webhook_secret": "WEBHOOK_SECRET"
 }
 ```
+
+`webhook_url` و `webhook_secret` فقط وقتی برمی‌گردند که `webhook_url` در درخواست ارسال شده باشد. secret را Hub می‌سازد و **فقط همین یک‌بار** برمی‌گرداند؛ باید در Planet ذخیره شود. `webhook_url` باید HTTPS، بدون credential و fragment، و بدون مقصد private/loopback باشد؛ در غیر این صورت HTTP 422 برمی‌گردد. اگر webhook ارسال نشود، پیام‌های ورودیِ فروشگاه آفلاین با خطای `store_offline` رد می‌شوند.
 
 توکن پروژه ۳۲ کاراکتر هگزادسیمال و `client_key` ۶۴ کاراکتر هگزادسیمال است. `project_id` و `client_key` را در بک‌اند نگهداری کنید. جلوگیری از عضویت تکراری با ایمیل یکسان هنوز پیاده‌سازی نشده است.
 
@@ -461,6 +472,31 @@ curl 'http://127.0.0.1:8765/api/projects/1/client-key' \
 
 این مقدار از توکن فعلی پروژه مشتق می‌شود. فقط در بک‌اند پروژه استفاده شود و به مرورگر ارسال نشود. برای دریافت کلید جدید، توکن پروژه را از مسیر ۳.۷ تعویض کنید.
 
+### ۳.۹. ثبت و حذف webhook پروژه
+
+`POST /api/projects/{project_id}/webhook`
+
+webhook پروژه (فروشگاه) را ثبت یا جایگزین می‌کند و **secret جدید** می‌سازد. secret قبلی بلافاصله باطل می‌شود.
+
+```bash
+curl -X POST 'http://127.0.0.1:8765/api/projects/1/webhook' \
+  -H 'Authorization: Bearer PROJECT_TOKEN' \
+  -H 'Content-Type: application/json' \
+  -d '{"webhook_url":"https://planet.example.ir/hooks/hub"}'
+```
+
+پاسخ موفق — HTTP 200 با `Cache-Control: no-store`:
+
+```json
+{
+  "status": true,
+  "webhook_url": "https://planet.example.ir/hooks/hub",
+  "webhook_secret": "WEBHOOK_SECRET"
+}
+```
+
+`DELETE /api/projects/{project_id}/webhook` آدرس و secret را پاک می‌کند. از این پس اگر اپراتوری آنلاین نباشد، پیام‌های ورودی با خطای `store_offline` رد می‌شوند. هر دو مسیر نرخ‌محدود هستند و شناسه مسیر باید با پروژه توکن مطابقت داشته باشد.
+
 <a id="socket"></a>
 ## ۴. Socket.IO
 
@@ -542,7 +578,7 @@ socket.on("chat_error", (error) => console.error(error.message));
 if (socket.connected) socket.emit("chat", message);
 ```
 
-هر هفت فیلد الزامی‌اند. مسیر پیام با پروژه و هویت اتصال تطبیق داده می‌شود. پیام به اپراتورهای همان پروژه و اتصال‌های همان گفتگو، شامل فرستنده، ارسال می‌شود. ارسال پاسخ به پیام‌رسان‌های غیر chat هنوز پیاده‌سازی نشده است.
+هر هفت فیلد الزامی‌اند. مسیر پیام با پروژه و هویت اتصال تطبیق داده می‌شود. پیام به اپراتورهای همان پروژه و اتصال‌های همان گفتگو، شامل فرستنده، ارسال می‌شود. اگر هیچ اپراتوری در اتاق پروژه آنلاین نباشد و webhook پروژه تنظیم شده باشد، پیام به‌جای emit به webhook امضاشدهٔ Planet می‌رود و فقط با پاسخ 2xx ACK موفق می‌گیرد. ارسال پاسخ به پیام‌رسان‌های غیر chat هنوز پیاده‌سازی نشده است.
 
 ### ۴.۴. Ping/Pong و وضعیت اتصال
 
@@ -568,7 +604,8 @@ const bridge = io(HUB_URL, {
 ```
 
 - سرویس بله در اتاق `bridge:bale` قرار می‌گیرد.
-- پیام ورودی مشتری را با `sender: "client"` و `source: "bale"` می‌فرستد؛ Hub آن را به اتاق پروژه می‌رساند.
+- پیام ورودی مشتری را با `sender: "client"` و `source: "bale"` می‌فرستد؛ Hub آن را به اتاق پروژه می‌رساند یا در صورت خالی بودن اتاق به webhook پروژه می‌دهد.
+- سرویس بله می‌تواند یک آرگومان دوم اختیاری با metadata انتقال بفرستد: `{"update_id": 12345, "chat_id": "501"}`. این metadata به هفت فیلد پیام اضافه نمی‌شود و فقط برای `delivery_id` و `conversation.chat_id` استفاده می‌شود.
 - پاسخ اپراتور با `sender: "operator"` و `source: "bale"` از Hub به همان اتاق bridge می‌رسد و سرویس بله آن را با `sendMessage` به بله می‌فرستد.
 - اگر bridge آنلاین نباشد، Hub پاسخ اپراتور را با `chat_error` رد می‌کند.
 - فقط یک اتصال bridge فعال برای `bale` پذیرفته می‌شود.
@@ -588,7 +625,7 @@ const bridge = io(HUB_URL, {
 
 ### ۵.۱. پیش‌نیازها
 
-- مایگریشن `003_add_bale_webhook_metadata.sql` اجرا شده باشد.
+- مایگریشن‌های `003_add_bale_webhook_metadata.sql` و `004_add_project_webhook.sql` (برای Hub) اجرا شده باشند.
 - `HUB_BALE_SERVICE_TOKEN` در Hub و سرویس بله یکسان باشد.
 - `BALE_PUBLIC_BASE_URL` یک دامنه HTTPS با پورت ۴۴۳ یا ۸۸ باشد؛ اگر `BALE_DISABLE_WEBHOOK_REGISTRATION=1` باشد این مورد لازم نیست.
 - Reverse Proxy مسیر `‎/webhooks/bale/<secret>` را به سرویس بله برساند. بقیه مسیرها لازم نیستند.
@@ -623,10 +660,14 @@ Bale → POST /webhooks/bale/<secret>
      → پیدا کردن source و project
      → dedup با update_id
      → تبدیل به پیام هفت‌فیلدی
-     → Socket.IO bridge → Hub → اتاق پروژه
+     → Socket.IO bridge → Hub
+                         ├─ اپراتور آنلاین: اتاق پروژه
+                         └─ اپراتور آفلاین: webhook پروژه در Planet
 ```
 
 - `update_id` در `sources.last_update_id` ذخیره می‌شود و فقط پس از ACK موفق Hub جلو می‌رود. اگر ACK از بین برود، ممکن است پیام یک‌بار تکراری به اپراتور برسد؛ پلنت باید این حالت را تحمل کند.
+- bridge بله همراه پیام، metadata انتقال (`update_id` و `chat_id`) را در آرگومان دوم می‌فرستد؛ این‌ها به هفت فیلد پیام اضافه نمی‌شوند.
+- اگر هیچ اپراتوری در اتاق پروژه نباشد، Hub پیام را با webhook امضاشده به Planet می‌فرستد و فقط پس از پاسخ 2xx به bridge ACK می‌دهد. اگر webhook تنظیم نشده یا شکست بخورد، پاسخ webhook بله 503 است و `last_update_id` جلو نمی‌رود.
 - فقط چت خصوصی پذیرفته می‌شود. پیام گروه/کانال و پیام ربات‌ها نادیده گرفته می‌شود.
 - متن از `text` یا `caption` گرفته می‌شود.
 - برای فایل‌ها فقط متادیتا (نوع، `file_id`، نام، MIME و اندازه) در `file` قرار می‌گیرد. فایل در Hub یا سرویس بله ذخیره نمی‌شود.
@@ -651,12 +692,130 @@ Bale → POST /webhooks/bale/<secret>
 - فقط چت خصوصی؛ گروه و کانال پشتیبانی نمی‌شوند.
 - فایل‌ها در S3/MinIO ذخیره نمی‌شوند و لینک پایدار ندارند.
 - `reply_to_message_id` در قرارداد نیست.
-- پیام‌های آفلاین در Hub صف نمی‌شوند؛ تاریخچه در Hub وجود ندارد.
+- پیام‌های آفلاین در Hub صف نمی‌شوند؛ اگر اپراتور آنلاین نباشد، پیام به webhook پروژه در Planet فرستاده می‌شود و بدون webhook یا بدون پاسخ 2xx، پیام ACK موفق نمی‌گیرد.
 - فقط یک نمونه از سرویس بله و یک نمونه از Hub باید اجرا شود.
 - برای توسعه محلی بدون دامنه عمومی، `BALE_DISABLE_WEBHOOK_REGISTRATION=1` را تنظیم کنید؛ در این حالت `BALE_PUBLIC_BASE_URL` لازم نیست و `BALE_WEBHOOK_REQUIRE_HTTPS` اعمال نمی‌شود، اما webhook بله واقعی هم کار نمی‌کند. فقط مسیر سرویس قابل تست دستی است.
 
+<a id="offline-webhook"></a>
+## ۶. پیام‌های فروشگاه آفلاین و webhook پلنت
+
+این رفتار **پیاده‌سازی شده** است. Hub همچنان هیچ پیام یا صفی ذخیره نمی‌کند؛ فقط وقتی اتاق پروژه خالی است، پیام را به webhook خود پروژه در Planet تحویل می‌دهد و تنها با پاسخ 2xx موفق می‌شود.
+
+### ۶.۱. جریان
+
+```text
+پیام از هر کانال (بله، چت داخلی، آداپتور بعدی)
+   → Hub پیام را اعتبارسنجی و project_id را از source/session استخراج می‌کند
+   → آیا اتاق project:{project_id} اپراتور آنلاین دارد؟
+        ├─ بله: emit فعلی به اپراتورها
+        └─ خیر: POST امضاشده به webhook پروژه در Planet
+                 ├─ 2xx: ACK موفق به فرستنده/bridge
+                 └─ خطا/timeout/بدون webhook: خطا؛ Bale پاسخ 503 و cursor جلو نمی‌رود
+```
+
+- webhook در سطح پروژه/فروشگاه است، نه یک منبع؛ چون باید برای بله، چت داخلی، روبیکا و کانال‌های بعدی یکسان کار کند.
+- `webhook_url` و `webhook_secret` در جدول `projects` ذخیره می‌شوند. ثبت اولیه یا `POST /api/projects/{id}/webhook` آن‌ها را می‌سازد/جایگزین می‌کند.
+- Hub وجود اپراتور را فقط از روی اتصال‌های نقش `operator` در اتاق پروژه تشخیص می‌دهد. هویت، تخصیص یا تعداد اپراتورها را نمی‌داند.
+- اگر اپراتوری آنلاین باشد، webhook صدا زده نمی‌شود.
+- فراخوانی webhook با `allow_redirects=False` و timeout کوتاه انجام می‌شود. فقط 2xx یعنی تحویل موفق.
+
+### ۶.۲. chat_id برای همه کانال‌ها
+
+`chat_id` شناسهٔ گفتگو در خود کانال است و به‌صورت metadata در webhook می‌آید، نه به‌عنوان فیلد هشتم پیام:
+
+| کانال | chat_id |
+| --- | --- |
+| بله | `message.chat.id`؛ سرویس بله آن را در metadata می‌فرستد |
+| چت داخلی | `user_id` امضاشده |
+| روبیکا/تلگرام/واتساپ/اینستاگرام | chat/thread id همان پلتفرم |
+
+کلید یکتای گفتگو:
+
+```text
+conversation_key = (project_id, source, robot_id, chat_id)
+```
+
+برای چت خصوصی معمولاً `chat_id == user_id` است؛ برای گروه در آینده این دو جدا می‌شوند.
+
+### ۶.۳. قرارداد و امضا
+
+```json
+{
+  "event": "chat.offline",
+  "project_id": 12,
+  "conversation": {
+    "source": "bale",
+    "robot_id": "987654",
+    "chat_id": "501"
+  },
+  "message": {
+    "user_id": "501",
+    "sender": "client",
+    "text": "سلام",
+    "file": null,
+    "robot_id": "987654",
+    "timestamp": 1794841200000,
+    "source": "bale"
+  },
+  "delivery_id": "bale:987654:12345"
+}
+```
+
+`message` دقیقاً همان هفت فیلد است. `project_id` و `conversation` metadata انتقال‌اند. `sender` همیشه `client` است؛ پاسخ اپراتور به webhook نمی‌رود.
+
+هدرها:
+
+```text
+Content-Type: application/json
+X-Hub-Event: chat.offline
+X-Hub-Delivery: <delivery_id>
+X-Hub-Timestamp: <unix-seconds>
+X-Hub-Signature-256: sha256=<hex hmac>
+```
+
+امضا با `HMAC-SHA256(webhook_secret, timestamp + "." + raw_body)` محاسبه می‌شود. Planet باید timestamp قدیمی را رد کند و `delivery_id` را برای idempotency یکتا نگه دارد.
+
+- برای بله `delivery_id` از `source:robot_id:update_id` ساخته می‌شود.
+- برای کانال بدون شناسه پیام، hash پایدار از source/robot_id/chat_id/timestamp/message ساخته می‌شود.
+- اگر Planet ذخیره کند ولی ACK از بین برود، تکرار اجتناب‌ناپذیر است؛ Planet باید با `delivery_id` تکرارها را حذف کند.
+
+### ۶.۴. رفتار خطا
+
+| وضعیت | نتیجه |
+| --- | --- |
+| اپراتور آنلاین | emit فعلی؛ webhook صدا زده نمی‌شود |
+| اپراتور آفلاین + webhook 2xx | پیام در Planet ذخیره شده؛ ACK موفق |
+| اپراتور آفلاین + webhook 4xx/5xx/timeout | ACK ناموفق؛ Bale پاسخ 503 و بدون جلو بردن cursor |
+| اپراتور آفلاین + بدون webhook | خطای `store_offline`؛ بدون ACK موفق |
+| webhook ذخیره کرد ولی ACK از بین رفت | تکرار؛ Planet با `delivery_id` حذف می‌کند |
+
+برای چت داخلی، خطا به‌صورت `chat_error` و ACK با `code` برابر `store_offline` یا `webhook_failed` برمی‌گردد.
+
+### ۶.۵. پیکربندی و امنیت
+
+```dotenv
+HUB_WEBHOOK_ALLOW_HTTP=0
+HUB_WEBHOOK_ALLOW_PRIVATE=0
+HUB_WEBHOOK_TIMEOUT=5
+```
+
+- به‌صورت پیش‌فرض فقط HTTPS پذیرفته می‌شود.
+- آدرس‌های loopback/private/link-local و hostnameهایی مثل `localhost` یا `*.internal` رد می‌شوند. هنگام تحویل، DNS دوباره بررسی می‌شود تا SSRF/DNS rebinding محدود شود.
+- redirect دنبال نمی‌شود.
+- URL، secret و متن پیام در لاگ‌های Hub ثبت نمی‌شوند.
+- `webhook_secret` فقط یک‌بار در پاسخ ثبت/تعویض برگردانده می‌شود و در GET عمومی نمایش داده نمی‌شود.
+- برای توسعه محلی می‌توان `HUB_WEBHOOK_ALLOW_HTTP=1` و در صورت نیاز `HUB_WEBHOOK_ALLOW_PRIVATE=1` را موقتاً فعال کرد.
+
+### ۶.۶. محدودیت‌ها
+
+- اگر اپراتور آنلاین باشد، پیام به webhook نمی‌رود؛ بنابراین Planet تاریخچهٔ کامل پیام‌های آنلاین را ندارد، مگر UI اپراتور آن‌ها را ثبت کند. اگر Planet باید system of record کامل باشد، webhook باید برای همهٔ پیام‌های ورودی صدا زده شود.
+- بین بررسی اتاق و emit ممکن است اپراتور قطع شود؛ این fallback best-effort است.
+- برای چت داخلی، webhook پیام مشتری را ذخیره می‌کند، ولی تحویل پاسخ اپراتور به مشتریِ قطع‌شده هنوز حل نشده است.
+- Bale حدود ۲۴ ساعت/۲٬۰۰۰ آپدیت نگه می‌دارد؛ برای قطعی طولانی‌تر Planet باید HA باشد یا یک صف محلی در `bale_service` اضافه شود.
+- Hub هیچ retry queue داخلی ندارد؛ retry در Bale یا کلاینت است.
+
 <a id="status-codes"></a>
-## ۶. کدهای وضعیت HTTP
+## ۷. کدهای وضعیت HTTP
 
 نمونه پاسخ خطای اعتبارسنجی:
 
@@ -681,29 +840,29 @@ Bale → POST /webhooks/bale/<secret>
 | 500 | خطای داخلی پیش‌بینی‌نشده (پاسخ JSON) |
 | 501 | عملیات واتساپ پیاده‌سازی نشده |
 | 502 | API پلتفرم در دسترس نیست یا پاسخ نامعتبر داد |
-| 503 | بررسی سلامت دیتابیس ناموفق بود |
+| 503 | بررسی سلامت دیتابیس ناموفق بود، یا Hub پیام Bale را نپذیرفت و سرویس بله باید دوباره تلاش کند |
 
 خطاهای `/api/` و استثناهای کنترل‌شده به‌صورت JSON برگردانده می‌شوند؛ مسیرهای ناموجود زیر `/api/` نیز پاسخ JSON با کد 404 دارند. مسیرهای خارج از `/api/` ممکن است پاسخ پیش‌فرض aiohttp داشته باشند.
 
-نرخ‌محدودی HTTP برای هر IP اعمال می‌شود: عضویت ۵ درخواست در دقیقه، تعویض توکن پروژه ۱۰ درخواست در دقیقه و سایر APIهای نیازمند احراز هویت ۳۰ درخواست در دقیقه. پاسخ 429 هدر `Retry-After` دارد.
+نرخ‌محدودی HTTP برای هر IP اعمال می‌شود: عضویت ۵ درخواست در دقیقه، تعویض توکن پروژه و ثبت/حذف webhook پروژه ۱۰ درخواست در دقیقه و سایر APIهای نیازمند احراز هویت ۳۰ درخواست در دقیقه. پاسخ 429 هدر `Retry-After` دارد.
 
 <a id="scope"></a>
-## ۷. محدوده نسخه فعلی
+## ۸. محدوده نسخه فعلی
 
-- سه جدول users، projects و sources؛ `webhook_secret` و `last_update_id` برای بله در همان جدول sources.
-- عضویت اولیه، ویرایش کاربر و پروژه، ثبت/ویرایش توکن/حذف منبع، تعویض توکن پروژه و دریافت کلید امضای کلاینت.
+- سه جدول users، projects و sources؛ `webhook_secret` و `last_update_id` برای بله در همان جدول sources و webhook پروژه (`webhook_url`، `webhook_secret`، `webhook_updated_at`) در جدول projects.
+- عضویت اولیه، ویرایش کاربر و پروژه، ثبت/ویرایش توکن/حذف منبع، تعویض توکن پروژه، ثبت/حذف webhook پروژه و دریافت کلید امضای کلاینت.
 - اتصال اپراتور با توکن پروژه؛ اتصال کلاینت با هویت امضاشده `robot_id + user_id`؛ مسیریابی پیام هفت‌فیلدی به پروژه و گفتگوی مربوطه.
 - اتصال bridge سرویس‌به‌سرویس بله با `HUB_BALE_SERVICE_TOKEN`؛ فقط یک bridge فعال برای هر provider.
 - سرویس مستقل بله: خواندن منابع، ثبت/حذف webhook، دریافت آپدیت، dedup با `update_id`، ارسال پیام و فایل به بله و صف ترتیبی هر ربات.
 - نرخ‌محدودی در حافظه برای مسیرهای حساس و محدودیت اندازه/نرخ پیام.
 - بدون Redis، صف پایدار، ذخیره تاریخچه پیام، اپراتور یا کلاینت در دیتابیس.
-- پیام‌های ارسال‌شده هنگام آفلاین بودن مقصد نگهداری نمی‌شوند.
+- اگر هیچ اپراتوری در اتاق پروژه آنلاین نباشد، پیام ورودی با webhook امضاشده به Planet فرستاده می‌شود؛ Hub خودش پیام یا صف نگه نمی‌دارد. بدون webhook یا بدون پاسخ 2xx، پیام ACK موفق نمی‌گیرد.
 - بله فقط چت خصوصی را پشتیبانی می‌کند؛ گروه/کانال، delivery ACK نهایی و ذخیره فایل در S3 هنوز پیاده‌سازی نشده‌اند.
 - ثبت منبع برای بله باعث تنظیم خودکار webhook توسط سرویس بله می‌شود. سایر پیام‌رسان‌ها هنوز آداپتور و ارسال پیام فعال ندارند.
 - توقف/راه‌اندازی مجدد Hub همه اتاق‌ها و اتصال‌های Socket.IO را از بین می‌برد؛ اجرای چندپروسه‌ای پشتیبانی نمی‌شود. سرویس بله نیز باید تک‌نمونه اجرا شود.
 - ورود کاربر با ایمیل/رمز، بازیابی رمز، جلوگیری از عضویت تکراری، ساخت پروژه دوم و خواندن فهرست/جزئیات پروژه‌ها هنوز پیاده‌سازی نشده‌اند. رمز عبور برای ورود آینده ذخیره می‌شود.
 - توکن منابع پیام‌رسان در دیتابیس به‌صورت متنی ذخیره می‌شود؛ امنیت دیتابیس و بکاپ‌ها بر عهده نصب‌کننده است.
 - صفحه‌های HTML دمو در این نسخه وجود ندارند؛ کلاینت‌ها باید قرارداد REST/Socket.IO این مستند را پیاده‌سازی کنند.
-- تست‌های واحد برای اعتبارسنجی، امضای کلاینت، محدودیت پیام، نرخ‌محدودی، bridge بله و webhook سرویس بله در `tests/` قرار دارند. تست integration با MariaDB و بله واقعی در مخزن نیست.
+- تست‌های واحد برای اعتبارسنجی، امضای کلاینت، محدودیت پیام، نرخ‌محدودی، bridge بله، webhook سرویس بله و webhook آفلاین پروژه در `tests/` قرار دارند. تست integration با MariaDB و بله واقعی در مخزن نیست.
 
 این مستند مربوط به پیاده‌سازی کنونی مخزن است، نه تأیید تست عملیاتی یا استقرار روی سرور.

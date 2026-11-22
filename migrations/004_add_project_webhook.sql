@@ -1,0 +1,8 @@
+ALTER TABLE projects
+    ADD COLUMN IF NOT EXISTS webhook_url VARCHAR(2048) NULL;
+
+ALTER TABLE projects
+    ADD COLUMN IF NOT EXISTS webhook_secret VARCHAR(64) NULL;
+
+ALTER TABLE projects
+    ADD COLUMN IF NOT EXISTS webhook_updated_at TIMESTAMP NULL;

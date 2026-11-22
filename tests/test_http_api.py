@@ -1,4 +1,6 @@
+import os
 import unittest
+from unittest import mock
 
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -57,6 +59,14 @@ async def _register_user(pool, **values):
     return "a" * 32, PROJECT_ID
 
 
+async def _set_project_webhook(pool, project_id, url, secret):
+    return project_id == PROJECT_ID
+
+
+async def _delete_project_webhook(pool, project_id):
+    return project_id == PROJECT_ID
+
+
 async def _get_project_token(pool, project_id):
     return PROJECT_TOKEN if project_id == PROJECT_ID else None
 
@@ -84,6 +94,7 @@ class HttpApiTests(unittest.IsolatedAsyncioTestCase):
             for name in (
                 "open_database", "authenticate_project", "register_user",
                 "get_project_token", "rotate_project_token",
+                "set_project_webhook", "delete_project_webhook",
             )
         }
         server.open_database = _open_database
@@ -91,6 +102,8 @@ class HttpApiTests(unittest.IsolatedAsyncioTestCase):
         server.register_user = _register_user
         server.get_project_token = _get_project_token
         server.rotate_project_token = _rotate_project_token
+        server.set_project_webhook = _set_project_webhook
+        server.delete_project_webhook = _delete_project_webhook
 
         self.app, self.sio, self.emit_source = server.create_app()
 
@@ -128,7 +141,86 @@ class HttpApiTests(unittest.IsolatedAsyncioTestCase):
             data["client_key"], server.derive_client_key("a" * 32)
         )
 
-    async def test_invalid_json_returns_json_error(self):
+    async def test_register_with_webhook_returns_a_one_time_secret(self):
+        payload = registration_payload()
+        payload["webhook_url"] = "https://planet.example.ir/hooks/hub"
+        with mock.patch.dict(
+            os.environ,
+            {"HUB_WEBHOOK_ALLOW_HTTP": "0", "HUB_WEBHOOK_ALLOW_PRIVATE": "0"},
+        ):
+            response = await self.client.post("/api/register", json=payload)
+        self.assertEqual(response.status, 201)
+        data = await response.json()
+        self.assertEqual(data["webhook_url"], payload["webhook_url"])
+        self.assertGreaterEqual(len(data["webhook_secret"]), 40)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+
+    async def test_register_with_webhook_passes_the_secret_to_storage(self):
+        payload = registration_payload()
+        payload["webhook_url"] = "https://planet.example.ir/hooks/hub"
+        register = mock.AsyncMock(return_value=("a" * 32, PROJECT_ID))
+        with mock.patch.object(server, "register_user", register), mock.patch.dict(
+            os.environ,
+            {"HUB_WEBHOOK_ALLOW_HTTP": "0", "HUB_WEBHOOK_ALLOW_PRIVATE": "0"},
+        ):
+            response = await self.client.post("/api/register", json=payload)
+        self.assertEqual(response.status, 201)
+        kwargs = register.await_args.kwargs
+        self.assertEqual(kwargs["webhook_url"], payload["webhook_url"])
+        self.assertGreaterEqual(len(kwargs["webhook_secret"]), 40)
+
+    async def test_register_rejects_an_unsafe_webhook_url(self):
+        payload = registration_payload()
+        payload["webhook_url"] = "http://planet.example.ir/hooks/hub"
+        with mock.patch.dict(
+            os.environ,
+            {"HUB_WEBHOOK_ALLOW_HTTP": "0", "HUB_WEBHOOK_ALLOW_PRIVATE": "0"},
+        ):
+            response = await self.client.post("/api/register", json=payload)
+        self.assertEqual(response.status, 422)
+        self.assertIn("HTTPS", (await response.json())["message"])
+
+    async def test_registration_without_webhook_has_no_secret(self):
+        response = await self.client.post(
+            "/api/register", json=registration_payload()
+        )
+        self.assertEqual(response.status, 201)
+        data = await response.json()
+        self.assertNotIn("webhook_secret", data)
+        self.assertNotIn("webhook_url", data)
+
+    async def test_project_webhook_can_be_set_and_removed(self):
+        payload = {"webhook_url": "https://planet.example.ir/hooks/hub"}
+        with mock.patch.dict(
+            os.environ,
+            {"HUB_WEBHOOK_ALLOW_HTTP": "0", "HUB_WEBHOOK_ALLOW_PRIVATE": "0"},
+        ):
+            response = await self.client.post(
+                f"/api/projects/{PROJECT_ID}/webhook",
+                json=payload,
+                headers=self.auth_headers(),
+            )
+        self.assertEqual(response.status, 200)
+        data = await response.json()
+        self.assertEqual(data["webhook_url"], payload["webhook_url"])
+        self.assertGreaterEqual(len(data["webhook_secret"]), 40)
+
+        response = await self.client.delete(
+            f"/api/projects/{PROJECT_ID}/webhook",
+            headers=self.auth_headers(),
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(await response.json(), {"status": True})
+
+    async def test_project_webhook_requires_matching_project(self):
+        response = await self.client.post(
+            f"/api/projects/{PROJECT_ID + 1}/webhook",
+            json={"webhook_url": "https://planet.example.ir/hooks/hub"},
+            headers=self.auth_headers(),
+        )
+        self.assertEqual(response.status, 403)
+
+
         response = await self.client.post(
             "/api/register",
             data="{not json",
