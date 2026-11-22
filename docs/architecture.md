@@ -407,6 +407,56 @@ bale_service
 - `delivery_id` برای idempotency است. برای بله می‌تواند از `update_id` ساخته شود. اگر در دسترس نیست، hash پایدار از source/robot_id/chat_id/timestamp/message.
 - Planet باید `delivery_id` را یکتا نگه دارد؛ دریافت تکراری باید همان 2xx را برگرداند.
 
+### ۸.۵.۱. ساختار کامل درخواست و پاسخ
+
+نمونهٔ درخواستی که Hub به URL ثبت‌شده در Planet می‌فرستد:
+
+```http
+POST /hooks/hub HTTP/1.1
+Host: planet.example.ir
+Content-Type: application/json
+Content-Length: <length>
+X-Hub-Event: chat.offline
+X-Hub-Delivery: bale:987654:12345
+X-Hub-Timestamp: 1794841200
+X-Hub-Signature-256: sha256=<hex hmac>
+
+{
+  "event": "chat.offline",
+  "project_id": 12,
+  "conversation": {
+    "source": "bale",
+    "robot_id": "987654",
+    "chat_id": "501"
+  },
+  "message": {
+    "user_id": "501",
+    "sender": "client",
+    "text": "سلام",
+    "file": null,
+    "robot_id": "987654",
+    "timestamp": 1794841200000,
+    "source": "bale"
+  },
+  "delivery_id": "bale:987654:12345"
+}
+```
+
+پاسخ موفق Planet باید `2xx` باشد؛ نمونه:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"ok": true}
+```
+
+- Hub بدنهٔ پاسخ را پردازش نمی‌کند؛ فقط status را بررسی می‌کند.
+- `2xx` فقط بعد از ذخیرهٔ ماندگار پیام یا ثبت آن در یک صف ماندگار مجاز است.
+- `3xx` دنبال نمی‌شود و شکست محسوب می‌شود.
+- `4xx`/`5xx`، timeout یا خطای اتصال یعنی شکست؛ Bale پاسخ `503` می‌گیرد و cursor را جلو نمی‌برد.
+- اگر Planet پیام را ذخیره کند ولی پاسخ از بین برود، Hub دوباره پیام را می‌فرستد؛ `delivery_id` باید idempotency را تضمین کند.
+
 ### ۸.۶. امضا و امنیت
 
 هدرها:
@@ -515,7 +565,140 @@ BALE_LOG_LEVEL=INFO
 
 ---
 
-## ۱۰. محدودیت‌ها و کارهای بعدی
+<a id="redis-cache"></a>
+## ۱۰. کش Redis و invalidation (طرح پیشنهادی)
+
+> **وضعیت:** هنوز پیاده‌سازی نشده است. این بخش قرارداد پیاده‌سازی فاز بعد است. MySQL منبع حقیقت می‌ماند و Redis فقط کش است.
+
+### ۱۰.۱. هدف
+
+- کاهش کوئری‌های تکراری MySQL در سه نقطهٔ داغ:
+  - `find_source_project` برای هر پیام Socket.IO
+  - `authenticate_project` و `find_source_project_with_token` برای هر اتصال
+  - `get_project_webhook` وقتی اتاق پروژه خالی است
+- جلوگیری از cache stampede هنگام انقضای کلید یا اتصال موجی اپراتورها.
+- حفظ invariantها: هیچ پیام، تاریخچه، اپراتور، تخصیص یا وضعیت حضور در Redis ذخیره نمی‌شود.
+
+### ۱۰.۲. چه چیزی کش می‌شود؟
+
+| داده | مقدار کش‌شده | نکته |
+| --- | --- | --- |
+| webhook پروژه | `webhook_url` و `webhook_secret` | secret باید مثل MySQL محافظت شود |
+| source → project | فقط `project_id` و `epoch` | برای bridge و مسیر پیام |
+| token → project | فقط `project_id` و `epoch` | خود توکن در value ذخیره نمی‌شود |
+| chat source | `project_id`، `client_key` و `epoch` | به‌جای توکن خام، `client_key` کش می‌شود |
+| negative cache | «وجود ندارد» | TTL کوتاه برای webhook/source ناموجود |
+
+کش نمی‌شود: متن پیام، فایل، تاریخچه، هویت/تخصیص اپراتور، وضعیت حضور، صف آفلاین.
+
+### ۱۰.۳. کلیدها و TTL
+
+```text
+hub:v1:p:{project_id}:epoch
+hub:v1:p:{project_id}:{epoch}:webhook
+hub:v1:src:{source}:{sha256(robot_id)}
+hub:v1:tok:{sha256(token)}
+hub:v1:chat:{sha256(robot_id)}
+hub:v1:neg:src:{source}:{sha256(robot_id)}:{epoch}
+```
+
+| کلید | مقدار | TTL پیشنهادی |
+| --- | --- | --- |
+| `p:{id}:epoch` | رشتهٔ تصادفی | طولانی (مثلاً ۳۰ روز، با تمدید) |
+| `p:{id}:{epoch}:webhook` | `{"url": "...", "secret": "..."}` | ۳ ساعت |
+| `src:{source}:{hash}` | `{"project_id": 12, "epoch": "..."}` | ۳ ساعت |
+| `tok:{hash}` | `{"project_id": 12, "epoch": "..."}` | ۱۵ دقیقه |
+| `chat:{hash}` | `{"project_id": 12, "client_key": "...", "epoch": "..."}` | ۳ ساعت |
+| `neg:src:...` | `"0"` | ۶۰ ثانیه |
+
+- TTL فقط برای پاکسازی خودکار است؛ invalidation واقعی با عوض کردن `epoch` انجام می‌شود.
+- TTL توکن عمداً کوتاه‌تر است چون توکن ریشهٔ دسترسی است. ۲–۵ ساعت برای توکن، پنجرهٔ سوءاستفادهٔ طولانی می‌سازد.
+- `sha256` روی `robot_id` و توکن فقط برای کوتاه/امن کردن نام کلید است؛ خود `robot_id` و توکن در key خام نمی‌آیند.
+
+### ۱۰.۴. مسیر خواندن (cache-aside)
+
+نمونهٔ source lookup:
+
+```text
+1. cipher = GET hub:v1:src:{source}:{hash}
+2. اگر cipher وجود داشت:
+     epoch = GET hub:v1:p:{cipher.project_id}:epoch
+     اگر epoch == cipher.epoch: return cipher.project_id
+3. project_id = SELECT ... FROM sources ...
+4. epoch = GET یا SET NX hub:v1:p:{project_id}:epoch
+5. SET hub:v1:src:... {"project_id":..., "epoch":...} EX 3h
+```
+
+- token auth: `GET tok:{hash}` → بررسی epoch → در صورت mismatch یا miss، کوئری MySQL و کش دوباره.
+- chat source: `GET chat:{hash}` → بررسی epoch → برگرداندن `project_id` و `client_key`.
+- webhook: `GET epoch` → `GET p:{id}:{epoch}:webhook` → در صورت miss، MySQL و کش.
+- negative cache فقط ۶۰ ثانیه؛ هر ایجاد/حذف source یا webhook با epoch جدید آن را بی‌اعتبار می‌کند.
+- اگر Redis خطا داد، خواندن از MySQL انجام می‌شود (fail-open). بعد از چند خطای پشت‌سرهم، یک circuit breaker کوتاه برای جلوگیری از latency اضافه شود.
+- برای هر key یک قفل کوتاه single-flight در حافظهٔ Hub بگذارید تا چند درخواست هم‌زمان چند کوئری تکراری نزنند. Hub تک‌نمونه‌ای است، پس قفل محلی کافی است.
+
+### ۱۰.۵. invalidation
+
+برای هر تغییر در داده‌های کش‌شده:
+
+```text
+1. new_epoch = random
+2. SET hub:v1:p:{project_id}:epoch new_epoch
+3. اگر Redis خطا داد و تغییر امنیتی است: پاسخ 503 و بدون تغییر MySQL
+4. تغییر را در MySQL انجام بده
+5. در صورت نیاز، sessionهای مرتبط را باطل/قطع کن
+```
+
+عوض کردن epoch کافی است؛ کلیدهای قبلی دیگر خوانده نمی‌شوند و با TTL خودشان پاک می‌شوند. نیازی به `SCAN` یا حذف دستی همهٔ کلیدها نیست.
+
+| تغییر | epoch | session |
+| --- | --- | --- |
+| ثبت اولیه پروژه | لازم نیست | — |
+| تعویض توکن پروژه | بله | همهٔ سوکت‌های پروژه قطع شوند |
+| تنظیم/تعویض/حذف webhook | بله | لازم نیست |
+| ایجاد source جدید | بله | لازم نیست |
+| تغییر token/robot source | بله | کلاینت‌های همان source قطع شوند |
+| حذف source | بله | کلاینت‌های همان source قطع شوند |
+| تغییر نام/domain/description پروژه | بله | لازم نیست |
+| تغییر user | لازم نیست | — |
+
+- اگر `HUB_REDIS_URL` تنظیم نشده باشد، همه‌چیز مثل قبل فقط از MySQL می‌آید.
+- اگر Redis تنظیم شده ولی در دسترس نیست، تغییرات حساس (تعویض توکن، تغییر webhook، تغییر/حذف source) بهتر است `503` برگردانند تا کش قدیمی سرو نشود. این رفتار باید با `HUB_CACHE_STRICT` قابل تنظیم باشد.
+- webhook در حال ارسال قابل لغو نیست؛ تغییر URL از پیام بعدی اثر می‌کند.
+- تغییر مستقیم MySQL خارج از API تا TTL کش دیده نمی‌شود؛ مسیر رسمی تغییر، API است.
+
+### ۱۰.۶. session و وب‌سوکت
+
+وضعیت فعلی: session سوکت فقط بعد از اتصال احراز هویت می‌شود و در پیام‌های بعدی دوباره توکن/امضا بررسی نمی‌شود. بنابراین:
+
+- **کش Redis** با epoch جدید، اتصال‌های جدید را فوراً با دادهٔ جدید احراز هویت می‌کند.
+- **سوکت‌های باز قبلی** خودبه‌خود باطل نمی‌شوند.
+
+طرح پیشنهادی برای بستن این شکاف:
+
+- در session سوکت `auth_epoch` ذخیره شود.
+- Hub یک `project_auth_epoch` در حافظه نگه دارد (تک‌نمونه).
+- در هر رویداد `chat`، `auth_epoch` session با مقدار فعلی پروژه مقایسه شود؛ در صورت mismatch پیام با `chat_error` و کد `session_expired` رد و سوکت قطع شود.
+- علاوه بر این، در تغییرات حساس، `disconnect` صریح هم انجام شود:
+  - تعویض توکن: همهٔ سوکت‌های آن پروژه (اپراتور و کلاینت)
+  - تغییر robot/token یک source: کلاینت‌های همان source
+  - حذف source: کلاینت‌های همان source
+- source جدید و تغییر webhook نیازی به قطع سوکت ندارند.
+- bridge بله با توکن سرویس احراز هویت می‌شود و به source خاصی bind نیست؛ حذف source باعث قطع bridge نمی‌شود، ولی پیام ورودی آن source دیگر مسیر معتبری ندارد.
+- بررسی `auth_epoch` در هر پیام هزینهٔ دیتابیس/Redis ندارد و برای وقتی که `disconnect` شکست بخورد، لایهٔ دفاع دوم است.
+
+### ۱۰.۷. امنیت و عملیات Redis
+
+- Redis باید فقط روی شبکهٔ خصوصی/loopback، با password/ACL و در صورت امکان TLS باشد؛ پورت عمومی نداشته باشد.
+- `webhook_secret` و `client_key` در Redis ذخیره می‌شوند؛ سطح دسترسی Redis باید مثل MySQL حساس باشد.
+- توکن خام پروژه در value ذخیره نشود؛ فقط `sha256(token)` در key و `project_id` در value.
+- URL، secret و متن پیام در لاگ ثبت نشود.
+- `maxmemory-policy` مناسب (`allkeys-lru` یا `volatile-lru`) انتخاب شود؛ eviction فقط باعث miss و fallback به MySQL می‌شود.
+- persistence (RDB/AOF) اختیاری است؛ Redis منبع حقیقت نیست و با restart/flush باید از MySQL پر شود.
+- متریک hit/miss، latency و خطاهای Redis اضافه شود؛ اما دیتابیس باید همچنان مسیر fallback باشد.
+
+---
+
+## ۱۱. محدودیت‌ها و کارهای بعدی
 
 1. **بدون صف پایدار داخلی**: اگر اپراتور آفلاین باشد، پیام از طریق webhook پروژه به Planet می‌رود؛ ولی اگر خود webhook شکست بخورد یا Hub بین دریافت و ACK قطع شود، پیام ورودی ممکن است از دست برود. Hub هیچ retry queue ندارد و retry در Bale/کلاینت است. برای production واقعی یا باید Planet HA باشد یا یک صف کوتاه‌مدت (Redis Streams/Queue) اضافه شود.
 2. **بدون تاریخچه در Hub**: طبق تصمیم فعلی، پلنت باید system of record باشد.

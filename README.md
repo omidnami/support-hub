@@ -779,6 +779,56 @@ X-Hub-Signature-256: sha256=<hex hmac>
 - برای کانال بدون شناسه پیام، hash پایدار از source/robot_id/chat_id/timestamp/message ساخته می‌شود.
 - اگر Planet ذخیره کند ولی ACK از بین برود، تکرار اجتناب‌ناپذیر است؛ Planet باید با `delivery_id` تکرارها را حذف کند.
 
+### ۶.۳.۱. راهنمای سریع اتصال سمت Planet
+
+1. یک endpoint از نوع `POST` روی HTTPS بسازید و URL آن را هنگام ثبت پروژه یا با `POST /api/projects/{id}/webhook` ثبت کنید. `webhook_secret` را فقط یک‌بار می‌گیرید؛ آن را امن ذخیره کنید.
+
+```bash
+curl -X POST 'https://hub.example.com/api/projects/1/webhook' \
+  -H 'Authorization: Bearer PROJECT_TOKEN' \
+  -H 'Content-Type: application/json' \
+  -d '{"webhook_url":"https://planet.example.ir/hooks/hub"}'
+```
+
+2. بدنهٔ خام درخواست را **قبل از parse کردن** نگه دارید و امضا را با همان بدنه بررسی کنید:
+
+```python
+import hashlib
+import hmac
+import time
+
+
+def verify_hub_webhook(secret: str, headers, raw_body: bytes) -> bool:
+    timestamp = headers.get("X-Hub-Timestamp", "")
+    signature = headers.get("X-Hub-Signature-256", "")
+    if headers.get("X-Hub-Event") != "chat.offline" or not timestamp.isdigit():
+        return False
+    if abs(time.time() - int(timestamp)) > 300:  # حداکثر ۵ دقیقه اختلاف
+        return False
+    expected = "sha256=" + hmac.new(
+        secret.encode("utf-8"),
+        timestamp.encode("ascii") + b"." + raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+```
+
+3. بعد از تأیید امضا، JSON را parse کنید. `message` همان هفت فیلد پیام است؛ `project_id`، `conversation` و `delivery_id` metadata انتقال‌اند.
+
+4. پیام را idempotent ذخیره کنید. برای `delivery_id` یک ایندکس یکتا بگذارید؛ اگر قبلاً ذخیره شده، همان پاسخ موفق را برگردانید.
+
+5. فقط بعد از ذخیرهٔ موفق و ماندگار، پاسخ `2xx` بدهید:
+
+```json
+{"ok": true}
+```
+
+- پاسخ `2xx` یعنی Hub اجازهٔ ACK به فرستنده/bridge را دارد.
+- پاسخ `4xx`/`5xx`، timeout یا redirect یعنی شکست؛ Bale پاسخ `503` می‌گیرد و `last_update_id` جلو نمی‌رود.
+- قبل از ذخیرهٔ کامل `2xx` برنگردانید و پیام را در حافظهٔ موقت نگه ندارید.
+- برای پردازش طولانی، اول در یک صف/جدول ماندگار ثبت کنید و بعد `2xx` بدهید.
+- URL و secret را در لاگ‌ها ثبت نکنید.
+
 ### ۶.۴. رفتار خطا
 
 | وضعیت | نتیجه |
@@ -813,6 +863,15 @@ HUB_WEBHOOK_TIMEOUT=5
 - برای چت داخلی، webhook پیام مشتری را ذخیره می‌کند، ولی تحویل پاسخ اپراتور به مشتریِ قطع‌شده هنوز حل نشده است.
 - Bale حدود ۲۴ ساعت/۲٬۰۰۰ آپدیت نگه می‌دارد؛ برای قطعی طولانی‌تر Planet باید HA باشد یا یک صف محلی در `bale_service` اضافه شود.
 - Hub هیچ retry queue داخلی ندارد؛ retry در Bale یا کلاینت است.
+
+### ۶.۷. کش Redis (فاز بعد)
+
+برای کاهش کوئری‌های تکراری MySQL، طرح کش metadata در [`docs/architecture.md` §۱۰](docs/architecture.md#redis-cache) مستند شده است. هنوز پیاده‌سازی نشده و MySQL منبع حقیقت است.
+
+- فقط metadata کش می‌شود: webhook پروژه، source→project، token→project و chat source. هیچ پیام، تاریخچه یا وضعیت اپراتور در Redis نمی‌رود.
+- TTL پیشنهادی: webhook/source **۳ ساعت**، token **۱۵ دقیقه** و negative cache **۶۰ ثانیه**.
+- invalidation با `epoch` هر پروژه انجام می‌شود؛ تغییر توکن، webhook یا sourceها epoch را عوض می‌کند و کلیدهای قبلی دیگر خوانده نمی‌شوند.
+- سوکت‌های باز با تغییر توکن خودکار باطل نمی‌شوند؛ `auth_epoch` در session و بررسی آن در هر پیام لازم است.
 
 <a id="status-codes"></a>
 ## ۷. کدهای وضعیت HTTP
@@ -855,7 +914,7 @@ HUB_WEBHOOK_TIMEOUT=5
 - اتصال bridge سرویس‌به‌سرویس بله با `HUB_BALE_SERVICE_TOKEN`؛ فقط یک bridge فعال برای هر provider.
 - سرویس مستقل بله: خواندن منابع، ثبت/حذف webhook، دریافت آپدیت، dedup با `update_id`، ارسال پیام و فایل به بله و صف ترتیبی هر ربات.
 - نرخ‌محدودی در حافظه برای مسیرهای حساس و محدودیت اندازه/نرخ پیام.
-- بدون Redis، صف پایدار، ذخیره تاریخچه پیام، اپراتور یا کلاینت در دیتابیس.
+- بدون Redis (کش metadata طبق [`docs/architecture.md` §۱۰](docs/architecture.md#redis-cache) پیشنهاد شده ولی هنوز پیاده‌سازی نشده)، صف پایدار، ذخیره تاریخچه پیام، اپراتور یا کلاینت در دیتابیس.
 - اگر هیچ اپراتوری در اتاق پروژه آنلاین نباشد، پیام ورودی با webhook امضاشده به Planet فرستاده می‌شود؛ Hub خودش پیام یا صف نگه نمی‌دارد. بدون webhook یا بدون پاسخ 2xx، پیام ACK موفق نمی‌گیرد.
 - بله فقط چت خصوصی را پشتیبانی می‌کند؛ گروه/کانال، delivery ACK نهایی و ذخیره فایل در S3 هنوز پیاده‌سازی نشده‌اند.
 - ثبت منبع برای بله باعث تنظیم خودکار webhook توسط سرویس بله می‌شود. سایر پیام‌رسان‌ها هنوز آداپتور و ارسال پیام فعال ندارند.

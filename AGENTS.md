@@ -435,6 +435,19 @@ That smoke script is also uncommitted; the durable coverage is in `tests/test_we
 - **Bale webhook drift** is not periodically verified with `getWebhookInfo`. If a webhook is deleted outside the service, `_registered` still caches it, so the service will not restore it until restart or a token/robot/URL change. Add periodic verification in a future phase.
 - **Long-running idle workers**: one task per bot with outbound traffic; acceptable at ~1,000 stores, revisit if scale grows.
 
+### Planned Redis metadata cache (not implemented)
+
+Documented in `docs/architecture.md` §10. MySQL stays the source of truth; Redis is optional cache-aside, enabled by `HUB_REDIS_URL`. Nothing message-related is cached.
+
+- Hot paths to protect: `find_source_project` (every Socket.IO message), `authenticate_project` / `find_source_project_with_token` (every connect), `get_project_webhook` (empty room).
+- Cache keys are versioned and project-scoped; the cache stores only metadata: webhook URL/secret, source→project, token→project (project id + epoch only, never the raw token), chat source→project + `client_key`, and a short negative cache.
+- TTLs: webhook/source/chat **3h**, token **15m** (root credential, deliberately shorter), negative **60s**.
+- Invalidation uses a per-project `epoch` (`hub:v1:p:{id}:epoch`). Every project/source/webhook/token change writes a new epoch; old keys become unreachable and expire on TTL. No `SCAN`.
+- Session impact: new connections see changes immediately; **already-open sockets do not**. Store `auth_epoch` in the Socket.IO session, compare it on every `chat` event, and disconnect on mismatch. Also explicitly disconnect all project sockets on token rotation and source clients on source token/robot change or deletion.
+- Fail-closed for security-sensitive writes when Redis is enabled but unavailable (token rotation, webhook change, source change/delete → `503`, no MySQL change), configurable via `HUB_CACHE_STRICT`. Reads may fail open to MySQL.
+- Add per-key in-process single-flight locks (Hub is single-instance) to avoid stampedes. Webhook URL changes affect the next delivery only; an in-flight POST cannot be cancelled.
+- Requires adding `redis>=5,<6` to `requirements.txt`; Redis must be private/authenticated because it holds `webhook_secret` and `client_key`.
+
 ---
 
 ## 13. Gotchas and hard-won fixes
@@ -485,4 +498,4 @@ Before finishing any change:
 - Local `.env` still needs `HUB_BALE_SERVICE_TOKEN`, `HUB_URL`, and `BALE_PUBLIC_BASE_URL` before the Bale service can run.
 - Real Bale verification is blocked on a real bot token and a public HTTPS endpoint on port 443/88.
 - The offline Planet webhook is implemented in `webhooks.py`, `server.py`, and `database.py`; docs are updated in `docs/architecture.md` §8 and README §6.
-- Next decisions: Planet persistence/offline policy, whether to ingest all inbound messages or only offline ones, internal-chat offline reply delivery, S3/MinIO attachments, final delivery ACK, and periodic `getWebhookInfo` verification.
+- Next decisions: implement the Redis metadata cache in `docs/architecture.md` §10 (epoch invalidation + socket `auth_epoch`), Planet persistence/offline policy, whether to ingest all inbound messages or only offline ones, internal-chat offline reply delivery, S3/MinIO attachments, final delivery ACK, and periodic `getWebhookInfo` verification.
