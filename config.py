@@ -38,3 +38,18 @@ def env_flag(name, default=False):
     if value is None:
         return default
     return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def env_origins(name="HUB_ALLOWED_ORIGINS"):
+    """Parse a comma-separated Socket.IO Origin allowlist from the environment.
+
+    Unset or empty keeps engine.io's same-origin default. ``*`` allows every
+    Origin, and any other value is split into exact origin strings.
+    """
+    value = (os.getenv(name) or "").strip()
+    if not value:
+        return None
+    if value == "*":
+        return "*"
+    origins = [part.strip() for part in value.split(",") if part.strip()]
+    return origins or None

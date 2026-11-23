@@ -238,6 +238,22 @@ async def get_source_name(pool, project_id, source_id):
             return row[0] if row else None
 
 
+async def get_source_identity(pool, project_id, source_id):
+    """Return ``(name, robot_id)`` for cache invalidation before a mutation."""
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT name, robot_id FROM sources "
+                "WHERE id = %s AND project_id = %s",
+                (source_id, project_id),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            return _decode_token(row[0]), _decode_token(row[1])
+
+
+
 async def update_source_token(pool, project_id, source_id, robot_id, token):
     async with pool.acquire() as conn:
         # Token changes invalidate the Bale webhook secret and dedup cursor:

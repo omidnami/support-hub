@@ -7,20 +7,24 @@ import os
 import secrets
 import time
 from collections import deque
-from urllib.parse import quote
+from urllib.parse import quote, urlencode, urlparse
 
 import aiohttp
 import socketio
 from aiohttp import web
 from pymysql.err import IntegrityError
 
-from config import env_flag, load_env_file
+from cache import (
+    CACHE_DOWN, CacheStrictError, MetadataCache, chat_key, negative_key,
+    source_key, token_key, webhook_key,
+)
+from config import env_flag, env_origins, load_env_file
 from database import (
     authenticate_project, delete_project_webhook, delete_source,
     find_source_project, find_source_project_with_token, get_project_token,
-    get_project_webhook, get_source_name, open_database, register_source,
-    register_user, rotate_project_token, set_project_webhook, update_project,
-    update_source_token, update_user,
+    get_project_webhook, get_source_identity, open_database,
+    register_source, register_user, rotate_project_token, set_project_webhook,
+    update_project, update_source_token, update_user,
 )
 from webhooks import (
     StoreOffline, WebhookDeliveryError, WebhookError, deliver_webhook,
@@ -60,6 +64,7 @@ HTTP_RATE_LIMITS = {
     ("POST", "/api/projects/{project_id}/webhook"): (10, 60),
     ("DELETE", "/api/projects/{project_id}/webhook"): (10, 60),
     ("GET", "/api/projects/{project_id}/client-key"): (30, 60),
+    ("GET", "/api/files"): (120, 60),
 }
 MESSAGE_LIMIT = 30
 MESSAGE_WINDOW = 10
@@ -116,6 +121,230 @@ def normalize_id(value):
     except UnicodeEncodeError:
         return None
     return value
+
+
+def valid_file_id(value):
+    if not isinstance(value, str):
+        return False
+    value = value.strip()
+    if not value or len(value) > 4096:
+        return False
+    if any(ord(c) < 32 or ord(c) == 127 for c in value):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def cache_unavailable():
+    return web.json_response(
+        {"status": False, "message": "Cache unavailable. Try again."},
+        status=503,
+        headers={"Retry-After": "5", "Cache-Control": "no-store"},
+    )
+
+
+async def _epoch_matches(cache, project_id, epoch):
+    if project_id is None or epoch is None:
+        return False
+    return await cache.epoch(project_id) == epoch
+
+
+def _negative_hit(value):
+    return value is not None and value is not CACHE_DOWN
+
+
+async def cached_authenticate_project(pool, cache, token):
+    """Resolve a project token through Redis, falling back to MySQL."""
+    if not cache.enabled or not isinstance(token, str) or not token:
+        return await authenticate_project(pool, token)
+    key = token_key(token)
+    negative = negative_key("tok", "token", token)
+
+    async def from_cache():
+        cached = await cache.get_json(key)
+        if isinstance(cached, dict) and await _epoch_matches(
+            cache, cached.get("project_id"), cached.get("epoch")
+        ):
+            return cached["project_id"]
+        if _negative_hit(await cache.get_json(negative)):
+            return None
+        return CACHE_DOWN
+
+    result = await from_cache()
+    if result is not CACHE_DOWN:
+        return result
+    async with cache.lock(key):
+        result = await from_cache()
+        if result is not CACHE_DOWN:
+            return result
+        project_id = await authenticate_project(pool, token)
+        if project_id is None:
+            await cache.set_json(negative, {"none": True}, cache.ttl_negative)
+            return None
+        epoch = await cache.epoch(project_id)
+        if epoch is not None:
+            await cache.set_json(
+                key,
+                {"project_id": project_id, "epoch": epoch},
+                cache.ttl_token,
+            )
+        return project_id
+
+
+async def cached_source_project(pool, cache, name, robot_id):
+    """Resolve source + robot_id to a project through Redis."""
+    if not cache.enabled:
+        return await find_source_project(pool, name, robot_id)
+    key = source_key(name, robot_id)
+    negative = negative_key("src", name, robot_id)
+
+    async def from_cache():
+        cached = await cache.get_json(key)
+        if isinstance(cached, dict) and await _epoch_matches(
+            cache, cached.get("project_id"), cached.get("epoch")
+        ):
+            return cached["project_id"]
+        if _negative_hit(await cache.get_json(negative)):
+            return None
+        return CACHE_DOWN
+
+    result = await from_cache()
+    if result is not CACHE_DOWN:
+        return result
+    async with cache.lock(key):
+        result = await from_cache()
+        if result is not CACHE_DOWN:
+            return result
+        project_id = await find_source_project(pool, name, robot_id)
+        if project_id is None:
+            await cache.set_json(negative, {"none": True}, cache.ttl_negative)
+            return None
+        epoch = await cache.epoch(project_id)
+        if epoch is not None:
+            await cache.set_json(
+                key,
+                {"project_id": project_id, "epoch": epoch},
+                cache.ttl_source,
+            )
+        return project_id
+
+
+async def cached_chat_source(pool, cache, robot_id):
+    """Resolve a chat source to ``(project_id, client_key)``."""
+    if not cache.enabled:
+        source = await find_source_project_with_token(pool, "chat", robot_id)
+        if source is None:
+            return None
+        project_id, project_token = source
+        return project_id, derive_client_key(project_token)
+    key = chat_key(robot_id)
+    negative = negative_key("chat", "chat", robot_id)
+
+    async def from_cache():
+        cached = await cache.get_json(key)
+        if isinstance(cached, dict) and await _epoch_matches(
+            cache, cached.get("project_id"), cached.get("epoch")
+        ):
+            return cached["project_id"], cached["client_key"]
+        if _negative_hit(await cache.get_json(negative)):
+            return None
+        return CACHE_DOWN
+
+    result = await from_cache()
+    if result is not CACHE_DOWN:
+        return result
+    async with cache.lock(key):
+        result = await from_cache()
+        if result is not CACHE_DOWN:
+            return result
+        source = await find_source_project_with_token(pool, "chat", robot_id)
+        if source is None:
+            await cache.set_json(negative, {"none": True}, cache.ttl_negative)
+            return None
+        project_id, project_token = source
+        client_key_value = derive_client_key(project_token)
+        epoch = await cache.epoch(project_id)
+        if epoch is not None:
+            await cache.set_json(
+                key,
+                {
+                    "project_id": project_id,
+                    "client_key": client_key_value,
+                    "epoch": epoch,
+                },
+                cache.ttl_source,
+            )
+        return project_id, client_key_value
+
+
+async def cached_project_webhook(pool, cache, project_id):
+    """Read a project webhook through Redis with a short negative cache."""
+    if not cache.enabled:
+        return await get_project_webhook(pool, project_id)
+    epoch = await cache.epoch(project_id)
+    if epoch is None:
+        return await get_project_webhook(pool, project_id)
+    key = webhook_key(project_id, epoch)
+
+    async def from_cache():
+        cached = await cache.get_json(key)
+        if cached is CACHE_DOWN or cached is None:
+            return CACHE_DOWN
+        if cached.get("none"):
+            return None
+        url = cached.get("url")
+        secret = cached.get("secret")
+        if url and secret:
+            return url, secret
+        return None
+
+    result = await from_cache()
+    if result is not CACHE_DOWN:
+        return result
+    async with cache.lock(key):
+        result = await from_cache()
+        if result is not CACHE_DOWN:
+            return result
+        webhook = await get_project_webhook(pool, project_id)
+        if webhook is None:
+            await cache.set_json(
+                key, {"none": True}, cache.ttl_negative
+            )
+        else:
+            await cache.set_json(
+                key,
+                {"url": webhook[0], "secret": webhook[1]},
+                cache.ttl_webhook,
+            )
+        return webhook
+
+
+async def invalidate_project_cache(cache, project_id, *, strict=None):
+    """Rotate a project epoch; optionally fail closed when Redis is down."""
+    if not cache.enabled:
+        return
+    epoch = await cache.rotate_epoch(project_id)
+    if epoch is None and (cache.strict if strict is None else strict):
+        raise CacheStrictError("Redis cache is unavailable.")
+
+
+async def invalidate_source_cache(cache, project_id, name, *robot_ids,
+                                  strict=None):
+    """Rotate the project epoch and drop source/negative keys."""
+    await invalidate_project_cache(cache, project_id, strict=strict)
+    keys = []
+    for robot_id in robot_ids:
+        keys.append(source_key(name, robot_id))
+        keys.append(negative_key("src", name, robot_id))
+        if name == "chat":
+            keys.append(chat_key(robot_id))
+            keys.append(negative_key("chat", "chat", robot_id))
+    if keys:
+        await cache.delete(*keys)
+
 
 
 def client_room(project_id, source, robot_id, user_id):
@@ -364,10 +593,26 @@ async def resolve_robot_id(name, token):
     return str(robot_id)
 
 
-def create_app():
+def create_app(cache=None):
     trust_proxy = env_flag("HUB_TRUST_PROXY")
+    file_adapters = {}
+    for name, env_name, default in (
+        ("bale", "BALE_SERVICE_URL", "http://127.0.0.1:8766"),
+    ):
+        value = os.getenv(env_name, default).strip().rstrip("/")
+        parsed_adapter = urlparse(value)
+        if parsed_adapter.scheme in ("http", "https") and parsed_adapter.netloc:
+            file_adapters[name] = value
+    file_service_token = os.getenv("HUB_BALE_SERVICE_TOKEN", "").strip()
+    try:
+        file_timeout = int(os.getenv("HUB_FILE_TIMEOUT", "30"))
+    except (TypeError, ValueError):
+        file_timeout = 30
+    file_timeout = max(1, min(file_timeout, 300))
     http_limiter = SlidingWindowLimiter()
     message_limiter = SlidingWindowLimiter()
+    if cache is None:
+        cache = MetadataCache.from_env()
 
     def request_ip(request):
         if trust_proxy:
@@ -416,20 +661,28 @@ def create_app():
         return await handler(request)
 
     app = web.Application(middlewares=[error_middleware, rate_limit_middleware])
-    sio = socketio.AsyncServer(async_mode="aiohttp", transports=["websocket"])
+    sio = socketio.AsyncServer(
+        async_mode="aiohttp", transports=["websocket"],
+        cors_allowed_origins=env_origins(),
+    )
     sio.attach(app)
 
     bridge_sids = {provider: set() for provider in BRIDGE_PROVIDERS}
     bridge_connecting = {provider: False for provider in BRIDGE_PROVIDERS}
     project_operators = {}
+    project_sessions = {}
+    project_auth_epoch = {}
+    source_auth_epoch = {}
     pool = None
 
     async def database_context(_app):
         nonlocal pool
         pool = await open_database()
+        await cache.start()
         try:
             yield
         finally:
+            await cache.close()
             pool.close()
             await pool.wait_closed()
 
@@ -439,10 +692,44 @@ def create_app():
         header = request.headers.get("Authorization", "")
         if not header.startswith("Bearer "):
             return None, failure("Project token required.", 401)
-        project_id = await authenticate_project(pool, header[7:])
+        project_id = await cached_authenticate_project(pool, cache, header[7:])
         if project_id is None:
             return None, failure("Invalid project token.", 401)
         return project_id, None
+
+    def track_session(sid, project_id, role, source=None, robot_id=None):
+        project_sessions.setdefault(project_id, {})[sid] = {
+            "role": role, "source": source, "robot_id": robot_id,
+        }
+
+    async def invalidate_project_sessions(project_id):
+        """Bump the project auth epoch and disconnect all project sockets."""
+        project_auth_epoch[project_id] = project_auth_epoch.get(project_id, 0) + 1
+        sessions = project_sessions.get(project_id, {})
+        for sid in list(sessions):
+            sessions.pop(sid, None)
+            try:
+                await sio.disconnect(sid)
+            except Exception:
+                logger.warning("Could not disconnect a stale socket.")
+
+    async def invalidate_source_sessions(project_id, source, robot_id):
+        """Bump the source auth epoch and disconnect matching clients."""
+        epoch_key = (project_id, source, str(robot_id))
+        source_auth_epoch[epoch_key] = source_auth_epoch.get(epoch_key, 0) + 1
+        sessions = project_sessions.get(project_id, {})
+        for sid, meta in list(sessions.items()):
+            if (
+                meta.get("role") == "client"
+                and meta.get("source") == source
+                and meta.get("robot_id") == str(robot_id)
+            ):
+                sessions.pop(sid, None)
+                try:
+                    await sio.disconnect(sid)
+                except Exception:
+                    logger.warning("Could not disconnect a stale socket.")
+
 
     async def register(request):
         try:
@@ -526,11 +813,20 @@ def create_app():
         except ValueError:
             return failure("Platform did not validate the source.", 422)
         try:
+            await invalidate_source_cache(cache, project_id, name, robot_id)
+        except CacheStrictError:
+            return cache_unavailable()
+        try:
             source_id = await register_source(pool, project_id, name, robot_id, token)
         except IntegrityError as exc:
             if exc.args and exc.args[0] == 1062:
                 return failure("Source already registered.", 409)
             raise
+        # Close the window where a concurrent read could cache the pre-insert
+        # state under the new epoch.
+        await invalidate_source_cache(
+            cache, project_id, name, robot_id, strict=False
+        )
         return web.json_response({
             "status": True, "id": source_id, "name": name,
             "robot_id": robot_id, "project_id": project_id,
@@ -570,6 +866,7 @@ def create_app():
             )
         except ValueError as exc:
             return failure(str(exc), 422)
+        await invalidate_project_cache(cache, project_id, strict=False)
         await update_project(pool, project_id, values)
         return web.json_response({"status": True})
 
@@ -582,9 +879,15 @@ def create_app():
             return failure("Invalid project_id.", 422)
         if target != project_id:
             return failure("Project does not match token.", 403)
+        try:
+            await invalidate_project_cache(cache, project_id)
+        except CacheStrictError:
+            return cache_unavailable()
         token = await rotate_project_token(pool, project_id)
         if token is None:
             return failure("Project not found.", 404)
+        await invalidate_project_cache(cache, project_id, strict=False)
+        await invalidate_project_sessions(project_id)
         return web.json_response(
             {
                 "status": True,
@@ -614,8 +917,13 @@ def create_app():
         except ValueError as exc:
             return failure(str(exc), 422)
         secret = secrets.token_urlsafe(32)
+        try:
+            await invalidate_project_cache(cache, project_id)
+        except CacheStrictError:
+            return cache_unavailable()
         if not await set_project_webhook(pool, project_id, url, secret):
             return failure("Project not found.", 404)
+        await invalidate_project_cache(cache, project_id, strict=False)
         return web.json_response(
             {
                 "status": True,
@@ -634,8 +942,13 @@ def create_app():
             return failure("Invalid project_id.", 422)
         if target != project_id:
             return failure("Project does not match token.", 403)
+        try:
+            await invalidate_project_cache(cache, project_id)
+        except CacheStrictError:
+            return cache_unavailable()
         if not await delete_project_webhook(pool, project_id):
             return failure("Project not found.", 404)
+        await invalidate_project_cache(cache, project_id, strict=False)
         return web.json_response({"status": True})
 
     async def client_key(request):
@@ -655,6 +968,82 @@ def create_app():
             headers={"Cache-Control": "no-store"},
         )
 
+    async def download_file(request):
+        project_id, error = await require_project(request)
+        if error:
+            return error
+        source = request.query.get("source", "")
+        robot_id = normalize_id(request.query.get("robot_id"))
+        file_id = request.query.get("file_id", "")
+        if source not in SOURCE_NAMES or robot_id is None \
+                or not valid_file_id(file_id):
+            return failure("Invalid file request.", 400)
+        if source == "chat":
+            return failure("Chat files are hosted by the project.", 404)
+        adapter_url = file_adapters.get(source)
+        if adapter_url is None:
+            return failure("File provider is not supported.", 404)
+        owner = await cached_source_project(pool, cache, source, robot_id)
+        if owner is None:
+            return failure("Source not found.", 404)
+        if owner != project_id:
+            return failure("Source does not belong to this project.", 403)
+        if not file_service_token:
+            return failure("File service is not configured.", 503)
+
+        query = urlencode({
+            "source": source, "robot_id": robot_id, "file_id": file_id,
+        })
+        url = f"{adapter_url}/internal/files?{query}"
+        timeout = aiohttp.ClientTimeout(
+            total=None, sock_connect=5, sock_read=file_timeout
+        )
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    url,
+                    headers={"Authorization": f"Bearer {file_service_token}"},
+                ) as upstream:
+                    if upstream.status != 200:
+                        if upstream.status == 404:
+                            return failure("File not found.", 404)
+                        if upstream.status == 410:
+                            return failure("File is no longer available.", 410)
+                        if upstream.status == 413:
+                            return failure("File is too large.", 413)
+                        if upstream.status == 400:
+                            return failure("Invalid file request.", 400)
+                        logger.warning(
+                            "File adapter returned HTTP %s for source %s.",
+                            upstream.status, source,
+                        )
+                        return failure("File service is unavailable.", 502)
+
+                    headers = {
+                        "Content-Type": upstream.headers.get(
+                            "Content-Type", "application/octet-stream"
+                        ),
+                        "Cache-Control": "private, max-age=300",
+                    }
+                    length = upstream.headers.get("Content-Length")
+                    if length:
+                        headers["Content-Length"] = length
+                    disposition = upstream.headers.get("Content-Disposition")
+                    if disposition:
+                        headers["Content-Disposition"] = disposition
+                    response = web.StreamResponse(status=200, headers=headers)
+                    await response.prepare(request)
+                    async for chunk in upstream.content.iter_chunked(65536):
+                        await response.write(chunk)
+                    await response.write_eof()
+                    return response
+        except asyncio.TimeoutError:
+            return failure("File service timed out.", 504)
+        except aiohttp.ClientError:
+            return failure("File service is unavailable.", 502)
+        except (ConnectionResetError, asyncio.CancelledError):
+            raise
+
     async def edit_source(request):
         project_id, error = await require_project(request)
         if error:
@@ -662,9 +1051,10 @@ def create_app():
         source_id = parse_path_id(request.match_info["source_id"])
         if source_id is None:
             return failure("Invalid source_id.", 422)
-        name = await get_source_name(pool, project_id, source_id)
-        if name is None:
+        identity = await get_source_identity(pool, project_id, source_id)
+        if identity is None:
             return failure("Source not found.", 404)
+        name, old_robot_id = identity
         try:
             # Token must be revalidated without silently trimming it.
             data = await request.json()
@@ -688,6 +1078,12 @@ def create_app():
         except ValueError:
             return failure("Platform did not validate the source.", 422)
         try:
+            await invalidate_source_cache(
+                cache, project_id, name, old_robot_id, robot_id
+            )
+        except CacheStrictError:
+            return cache_unavailable()
+        try:
             updated = await update_source_token(pool, project_id, source_id, robot_id, token)
         except IntegrityError as exc:
             if exc.args and exc.args[0] == 1062:
@@ -695,6 +1091,12 @@ def create_app():
             raise
         if not updated:
             return failure("Source not found.", 404)
+        await invalidate_source_cache(
+            cache, project_id, name, old_robot_id, robot_id, strict=False
+        )
+        await invalidate_source_sessions(project_id, name, old_robot_id)
+        if str(old_robot_id) != str(robot_id):
+            await invalidate_source_sessions(project_id, name, robot_id)
         return web.json_response({
             "status": True, "id": source_id, "name": name,
             "robot_id": robot_id, "project_id": project_id,
@@ -707,8 +1109,20 @@ def create_app():
         source_id = parse_path_id(request.match_info["source_id"])
         if source_id is None:
             return failure("Invalid source_id.", 422)
+        identity = await get_source_identity(pool, project_id, source_id)
+        if identity is None:
+            return failure("Source not found.", 404)
+        name, robot_id = identity
+        try:
+            await invalidate_source_cache(cache, project_id, name, robot_id)
+        except CacheStrictError:
+            return cache_unavailable()
         if not await delete_source(pool, project_id, source_id):
             return failure("Source not found.", 404)
+        await invalidate_source_cache(
+            cache, project_id, name, robot_id, strict=False
+        )
+        await invalidate_source_sessions(project_id, name, robot_id)
         return web.json_response({"status": True})
 
     app.router.add_post("/api/register", register)
@@ -719,6 +1133,7 @@ def create_app():
     app.router.add_post("/api/projects/{project_id}/webhook", set_webhook)
     app.router.add_delete("/api/projects/{project_id}/webhook", remove_webhook)
     app.router.add_get("/api/projects/{project_id}/client-key", client_key)
+    app.router.add_get("/api/files", download_file)
     app.router.add_post("/api/sources", add_source)
     app.router.add_patch("/api/sources/{source_id}", edit_source)
     app.router.add_delete("/api/sources/{source_id}", remove_source)
@@ -741,7 +1156,7 @@ def create_app():
 
         if chat_id is None:
             chat_id = payload["user_id"]
-        webhook = await get_project_webhook(pool, project_id)
+        webhook = await cached_project_webhook(pool, cache, project_id)
         if not webhook:
             raise StoreOffline("Store is offline and no webhook is configured.")
         url, secret = webhook
@@ -767,7 +1182,9 @@ def create_app():
             return False
         if payload["source"] != name or payload["robot_id"] != normalize_id(robot_id):
             return False
-        project_id = await find_source_project(pool, name, payload["robot_id"])
+        project_id = await cached_source_project(
+            pool, cache, name, payload["robot_id"]
+        )
         if project_id is None:
             return False
         try:
@@ -788,18 +1205,26 @@ def create_app():
             return False
         role = auth.get("role", "operator" if "token" in auth else None)
         if role == "operator":
-            project_id = await authenticate_project(pool, auth.get("token"))
+            project_id = await cached_authenticate_project(
+                pool, cache, auth.get("token")
+            )
             if project_id is None:
                 return False
-            await sio.save_session(sid, {"role": role, "project_id": project_id})
+            await sio.save_session(sid, {
+                "role": role,
+                "project_id": project_id,
+                "auth_epoch": project_auth_epoch.get(project_id, 0),
+            })
             await sio.enter_room(sid, room(project_id))
             project_operators.setdefault(project_id, set()).add(sid)
+            track_session(sid, project_id, role)
             try:
                 await sio.emit(
                     "authenticated", {"role": role, "project_id": project_id}, to=sid
                 )
             except BaseException:
                 project_operators[project_id].discard(sid)
+                project_sessions.get(project_id, {}).pop(sid, None)
                 raise
         elif role == "client":
             robot_id = normalize_id(auth.get("robot_id"))
@@ -807,21 +1232,24 @@ def create_app():
             if robot_id is None or user_id is None:
                 return False
             # Browser clients can use only registered chat sources, never bot tokens.
-            source = await find_source_project_with_token(pool, "chat", robot_id)
+            source = await cached_chat_source(pool, cache, robot_id)
             if source is None:
                 return False
-            project_id, project_token = source
-            client_key_value = derive_client_key(project_token)
+            project_id, client_key_value = source
             if not verify_client_signature(
                 client_key_value, robot_id, user_id,
                 auth.get("expires"), auth.get("signature"),
             ):
                 return False
+            source_epoch_key = (project_id, "chat", robot_id)
             await sio.save_session(sid, {
                 "role": role, "project_id": project_id,
                 "source": "chat", "robot_id": robot_id, "user_id": user_id,
+                "auth_epoch": project_auth_epoch.get(project_id, 0),
+                "source_epoch": source_auth_epoch.get(source_epoch_key, 0),
             })
             await sio.enter_room(sid, client_room(project_id, "chat", robot_id, user_id))
+            track_session(sid, project_id, role, "chat", robot_id)
             await sio.emit("authenticated", {
                 "role": role, "robot_id": robot_id, "user_id": user_id,
             }, to=sid)
@@ -862,6 +1290,10 @@ def create_app():
             sids.discard(sid)
         for project_id in [p for p, sids in project_operators.items() if not sids]:
             project_operators.pop(project_id, None)
+        for project_id, sessions in list(project_sessions.items()):
+            sessions.pop(sid, None)
+            if not sessions:
+                project_sessions.pop(project_id, None)
 
     async def chat_failure(sid, message, code=None):
         result = {"status": False, "message": message}
@@ -885,6 +1317,26 @@ def create_app():
                 return await chat_failure(sid, "Not authenticated.")
         else:
             return await chat_failure(sid, "Not authenticated.")
+
+        if role in ("operator", "client"):
+            if project_auth_epoch.get(project_id, 0) != session.get("auth_epoch", 0):
+                result = await chat_failure(
+                    sid, "Session expired. Reconnect.", code="session_expired"
+                )
+                await sio.disconnect(sid)
+                return result
+            if role == "client":
+                epoch_key = (
+                    project_id, session.get("source"), session.get("robot_id")
+                )
+                if source_auth_epoch.get(epoch_key, 0) != session.get(
+                    "source_epoch", 0
+                ):
+                    result = await chat_failure(
+                        sid, "Session expired. Reconnect.", code="session_expired"
+                    )
+                    await sio.disconnect(sid)
+                    return result
 
         if role == "bridge":
             limit_key = ("bridge", provider)
@@ -918,7 +1370,7 @@ def create_app():
             return await chat_failure(sid, "Message does not match the connected client.")
 
         # The source identifies the project and cannot override the session.
-        source_project = await find_source_project(pool, source, robot_id)
+        source_project = await cached_source_project(pool, cache, source, robot_id)
         if role == "bridge":
             if source != provider:
                 return await chat_failure(sid, "Bridge cannot send this source.")

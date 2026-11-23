@@ -2,7 +2,7 @@
 
 > حافظه پروژه برای مدل‌ها و ایجنت‌ها. پیش از هر تغییر این فایل را بخوانید و اگر تصمیم معماری، قرارداد یا محدودیت عملیاتی تغییر کرد، همین فایل را هم به‌روزرسانی کنید.
 
-**Last verified:** 2026-11-22 · base implementation commit `e13d931` · 151 tests passing (docs may be newer)
+**Last verified:** 2026-11-23 · base implementation commit `e13d931` · 201 tests passing (docs may be newer)
 
 ---
 
@@ -18,7 +18,7 @@ Support Hub is a **transport-only relay** for roughly **1,000 stores**.
 - **Bale customers never connect to Socket.IO.** Only the independent `bale_service` talks to both Hub and the Bale API.
 - Phase one supports **internal chat + private Bale chats only**.
 
-Non-goals for now: group/channel chats, durable queues, message history in Hub, final delivery ACKs, S3/MinIO file storage, Redis adapter, multi-process Hub, WhatsApp/Telegram/Rubika adapters.
+Non-goals for now: group/channel chats, durable queues, message history in Hub, final delivery ACKs, permanent S3/MinIO file storage (a bounded temporary adapter cache is implemented), Redis adapter, multi-process Hub, WhatsApp/Telegram/Rubika adapters.
 
 ---
 
@@ -38,6 +38,7 @@ Non-goals for now: group/channel chats, durable queues, message history in Hub, 
 11. **Keep changes consistent with existing style.** Run the full test suite and compile step before finishing.
 12. **Do not commit unless the user explicitly asks.** (Earlier work was committed externally; keep future changes uncommitted by default.)
 13. **Do not silently ACK offline inbound.** If the project room has no operator, Hub sends a signed project webhook to Planet and only ACKs on `2xx`. If the webhook is missing or fails, the inbound message is rejected (`store_offline` / `webhook_failed`). Hub still stores no message or queue.
+14. **Files are fetched on demand, never stored permanently in Hub.** `GET /api/files` authenticates the project and proxies to the provider adapter; the bot token stays in the adapter. Adapters may keep a bounded temporary disk cache with a TTL (Bale: 1h), but no message/file history.
 
 ---
 
@@ -167,16 +168,17 @@ Status codes:
 Semantics:
 
 - **At-least-once** delivery to Hub: if Hub processes but the ACK is lost, the update may reach operators twice.
-- Duplicate `update_id <= last_update_id` is acknowledged but not forwarded.
+- Duplicate `update_id <= last_update_id` is acknowledged but not forwarded, **unless that ID is in the temporary failed-update window**. A later success must not mask an earlier failed update.
+- Failed update IDs are kept for 24h in Redis (`hub:v1:bale:failed:<sha256(secret)>`) when `HUB_REDIS_URL` is set, otherwise in memory; they are cleared after a successful retry.
 - Unsupported/service messages advance the cursor and are not forwarded.
 - Only `message` updates in **private** chats; groups/channels and bot senders ignored.
-- Files are relayed as **metadata only**; no download and no S3 storage.
+- Files are relayed as **metadata only**; actual bytes are fetched on demand through the File Resolver (`GET /api/files`) and never stored permanently in Hub.
 
 ### Outbound
 
 ```text
 operator reply → Hub → bridge:bale → bale_service per-bot queue
-              → sendMessage / sendPhoto / sendDocument → Bale customer
+              → sendMessage / sendPhoto / sendVoice / sendAudio / sendVideo / sendAnimation / sendDocument → Bale customer
 ```
 
 - One ordered `asyncio.Queue` per `robot_id`; queue size 1000.
@@ -186,12 +188,32 @@ operator reply → Hub → bridge:bale → bale_service per-bot queue
 - On Bale 401, the service re-reads the source token from DB and retries once if it changed.
 - Permanent Bale errors are logged and dropped; the operator does not receive a final delivery ACK.
 - Empty `file` values (`null`, `""`, `{}`) fall back to text.
+- Outbound files use the same `file` object; `file_id` is best for resending an inbound file, `url` works for photos and GIF/PDF/ZIP documents. New multipart uploads and browser-voice conversion are not implemented yet.
+
+### File Resolver (implemented)
+
+```text
+UI/Planet → GET /api/files?source=bale&robot_id=&file_id= (project token)
+          → Hub checks source/project ownership
+          → GET /internal/files (HUB_BALE_SERVICE_TOKEN) → bale_service
+          → getFile + download ≤20MB + temporary disk cache → stream back
+```
+
+- Hub never sees the bot token and never buffers the whole file; it streams bytes.
+- `bale_service` caches bytes on disk keyed by `sha256(robot_id + "\0" + file_id)` for 1h (configurable), with total-size cap and cleanup.
+- Provider URLs (Bale `getFile` links, 1h) are never put in the message payload; `file_id` is the durable reference.
+- `file_id` is bot-specific; the endpoint scopes it by `source + robot_id` and project ownership.
+- Access is project-scoped, not conversation-scoped (Hub stores no history). Planet remains responsible for per-conversation authorization.
+- `chat` files stay on Planet and are read from `file.url`; no Hub file endpoint is used.
+- A future Rubika adapter implements the same `/internal/files` contract; Hub does not change.
 
 ### Bale limits and gotchas
 
 - Bale keeps the last **2,000 updates for 24 hours**.
-- `getFile` links expire after about **1 hour**.
-- `file_id` is bot-specific.
+- `getFile` links expire after about **1 hour**; bots can download at most **20MB** per file.
+- Sending: multipart photos ≤10MB, other files ≤50MB; by URL photos ≤5MB and documents only GIF/PDF/ZIP; `sendVoice` by URL only OGG ≤1MB.
+- `file_id` is bot-specific; type cannot be changed when resending by `file_id`.
+- Native sticker sending is not supported (Bale has no `sendSticker` method and `file_id` type is fixed); stickers are receive/view only.
 - Bale `sendMessage` text limit is **4,096**; captions are shorter (we use 1,024).
 - There is no way to put a secret in `setWebhook`; the URL is the secret.
 - Update IDs are per bot. When a source token/robot changes, **clear `webhook_secret` and `last_update_id`** so old-bot state cannot leak into the new bot.
@@ -252,9 +274,11 @@ Run migrations:
 | `server.py` | Hub REST API + Socket.IO auth, rooms, routing, operator presence, rate limits, bridge support |
 | `database.py` | DB pool, migrations, project webhook queries, source token update transaction |
 | `webhooks.py` | Webhook URL validation, signed offline payload, delivery ID, HMAC delivery |
+| `cache.py` | Optional Redis metadata cache: epochs, TTLs, negative cache, single-flight locks, fail-open/fail-closed semantics |
 | `config.py` | `.env` loading, env flags |
-| `bale_service/service.py` | Lifecycle, webhook handler, source sync, dedup, health, outbound dispatcher |
-| `bale_service/api.py` | Bale Bot API client, webhook registration, text/caption splitting, send |
+| `bale_service/service.py` | Lifecycle, webhook handler, source sync, dedup, file endpoint, health, outbound dispatcher |
+| `bale_service/files.py` | Temporary disk cache for downloaded provider files (TTL, size cap, atomic writes) |
+| `bale_service/api.py` | Bale Bot API client, webhook registration, text/caption splitting, file metadata/download, send |
 | `bale_service/hub.py` | Socket.IO bridge client, reconnect/backoff, inbound call, operator event filter |
 | `bale_service/mapping.py` | Bale update → seven-field envelope, attachment metadata |
 | `bale_service/repository.py` | Bale source queries, secret generation, dedup cursor updates |
@@ -280,15 +304,31 @@ HUB_DB_PASSWORD=...
 HUB_HOST=127.0.0.1
 HUB_PORT=8765
 HUB_TRUST_PROXY=0
+HUB_ALLOWED_ORIGINS=*
 HUB_LOG_LEVEL=INFO
 HUB_BALE_SERVICE_TOKEN=<long-random-shared-secret>
+BALE_SERVICE_URL=http://127.0.0.1:8766
+HUB_FILE_TIMEOUT=30
 HUB_WEBHOOK_ALLOW_HTTP=0
 HUB_WEBHOOK_ALLOW_PRIVATE=0
 HUB_WEBHOOK_TIMEOUT=5
+HUB_REDIS_URL=
+HUB_CACHE_STRICT=0
+HUB_CACHE_TTL_WEBHOOK=10800
+HUB_CACHE_TTL_SOURCE=10800
+HUB_CACHE_TTL_TOKEN=900
+HUB_CACHE_TTL_NEGATIVE=60
 ```
 
+- `HUB_REDIS_URL` empty disables the cache entirely. Reads fail open to MySQL on Redis errors. The Bale service also reads `HUB_REDIS_URL` to persist its temporary failed-update window; without it the window stays in memory.
+- `HUB_CACHE_STRICT=1` rejects token/webhook/source mutations with `503` when Redis is down, before touching MySQL.
+- Cache TTLs are seconds; defaults are 3h webhook/source, 15m token, 60s negative.
 - `HUB_WEBHOOK_ALLOW_HTTP` and `HUB_WEBHOOK_ALLOW_PRIVATE` are development-only. Both must be `0` in production.
+- `HUB_ALLOWED_ORIGINS` controls Socket.IO Origin acceptance (`*` = any, empty = same-origin, comma list = exact). Origin is **not** authentication: operator project tokens and client `robot_id + user_id` signatures are the boundaries, and non-browser clients can spoof or omit Origin.
+- `HUB_TRUST_PROXY` and `HUB_ALLOWED_ORIGINS` are independent: the former only affects rate-limit IPs, the latter only Socket.IO Origin checks.
 - `HUB_WEBHOOK_TIMEOUT` is seconds (default 5, capped at 30).
+- `BALE_SERVICE_URL` is an internal adapter URL used only for `GET /api/files`; never expose it publicly.
+- `HUB_FILE_TIMEOUT` is the per-read timeout for proxied files (default 30s).
 
 Bale service:
 
@@ -306,6 +346,11 @@ BALE_MAX_UPDATE_BYTES=1048576
 BALE_WEBHOOK_REQUIRE_HTTPS=1
 BALE_DISABLE_WEBHOOK_REGISTRATION=0
 BALE_LOG_LEVEL=INFO
+BALE_FILE_CACHE_DIR=/var/cache/support-hub/files
+BALE_FILE_CACHE_TTL=3600
+BALE_FILE_CACHE_MAX_BYTES=536870912
+BALE_FILE_MAX_BYTES=20971520
+BALE_FILE_DOWNLOAD_TIMEOUT=30
 ```
 
 Local `.env` status at last verification: **`HUB_BALE_SERVICE_TOKEN`, `HUB_URL`, and `BALE_PUBLIC_BASE_URL` were still missing**. The service will not start without the token; webhook registration also requires the public HTTPS URL.
@@ -392,13 +437,16 @@ That smoke script is also uncommitted; the durable coverage is in `tests/test_we
 | `tests/test_http_api.py` | registration, webhook registration/set/delete, tokens, client key, JSON errors, rate limits |
 | `tests/test_socket_integration.py` | operator/client routing, bridge auth, inbound/outbound, offline webhook fallback, bridge metadata, duplicate/concurrent bridge |
 | `tests/test_bale_mapping.py` | Bale update mapping, text/file metadata, splitting, file references |
-| `tests/test_bale_api.py` | `setWebhook`, sendMessage/sendPhoto, 429 retry, errors, caption limit |
+| `tests/test_bale_api.py` | `setWebhook`, sendMessage/sendPhoto, getFile/download, 429 retry, errors, caption limit |
 | `tests/test_bale_webhook.py` | webhook status codes, dedup, ignored updates, Hub failures, health, sync, token rotation, outbound queue |
+| `tests/test_bale_files.py` | adapter file auth, getFile/download, cache hit/TTL/size, error mapping |
+| `tests/test_file_api.py` | Hub `/api/files` auth, ownership, streaming, adapter error mapping |
 | `tests/test_bale_repository.py` | row decoding, secret generation, dedup cursor SQL |
 | `tests/test_bale_hub.py` | bridge inbound ACK/rejection/timeout, operator event filter |
 | `tests/test_bale_config.py` | required token, HTTPS/port rules, registration disable |
 | `tests/test_database_source.py` | source token transaction, project webhook queries, Bale state reset, missing source |
 | `tests/test_webhooks.py` | URL/SSRF validation, delivery IDs, payload/signature, signed delivery, redirects, timeouts |
+| `tests/test_cache.py` | Redis primitives, epoch rotation, TTLs, negative cache, cache-aside helpers, strict fail-closed |
 
 **Not in the repo:** integration tests against real MariaDB or the real Bale API. The manual E2E above is the substitute.
 
@@ -426,7 +474,7 @@ That smoke script is also uncommitted; the durable coverage is in `tests/test_we
 - **Offline-only webhook is not a complete history**: if an operator is online, Planet does not receive the message unless the operator UI also persists it. Ingest all inbound messages if Planet must be the full system of record.
 - **Internal-chat customer offline**: the inbound message can be stored by Planet, but a later operator reply to a disconnected client has no Hub history/backlog path yet.
 - **No final delivery ACK**: ACK means Hub received the message, not that Bale delivered it.
-- **Attachments are metadata only**: no S3/MinIO, no stable download links.
+- **Attachments are metadata in Hub; bytes are on demand**: files are proxied through `GET /api/files` and cached temporarily by the adapter; no S3/MinIO or stable server-side link in Hub.
 - **Private Bale chats only**: group/channel support needs a separate sender/conversation model.
 - **No Redis adapter**: Hub and bridge are single-instance.
 - **No operator identity/assignment in Hub**: Planet owns this.
@@ -435,18 +483,18 @@ That smoke script is also uncommitted; the durable coverage is in `tests/test_we
 - **Bale webhook drift** is not periodically verified with `getWebhookInfo`. If a webhook is deleted outside the service, `_registered` still caches it, so the service will not restore it until restart or a token/robot/URL change. Add periodic verification in a future phase.
 - **Long-running idle workers**: one task per bot with outbound traffic; acceptable at ~1,000 stores, revisit if scale grows.
 
-### Planned Redis metadata cache (not implemented)
+### Redis metadata cache (implemented)
 
-Documented in `docs/architecture.md` §10. MySQL stays the source of truth; Redis is optional cache-aside, enabled by `HUB_REDIS_URL`. Nothing message-related is cached.
+Documented in `docs/architecture.md` §10 and implemented in `cache.py` + module-level cache-aside helpers in `server.py`. MySQL stays the source of truth; Redis is optional cache-aside, enabled by `HUB_REDIS_URL`. Nothing message-related is cached.
 
-- Hot paths to protect: `find_source_project` (every Socket.IO message), `authenticate_project` / `find_source_project_with_token` (every connect), `get_project_webhook` (empty room).
-- Cache keys are versioned and project-scoped; the cache stores only metadata: webhook URL/secret, source→project, token→project (project id + epoch only, never the raw token), chat source→project + `client_key`, and a short negative cache.
+- Hot paths: `find_source_project` (every Socket.IO message), `authenticate_project` / `find_source_project_with_token` (every connect), `get_project_webhook` (empty room).
+- Stored metadata only: webhook URL/secret, source→project, token→project (project id + epoch only, never the raw token), chat source→project + `client_key`, and short negative entries. `client_key` is cached instead of the project token.
 - TTLs: webhook/source/chat **3h**, token **15m** (root credential, deliberately shorter), negative **60s**.
-- Invalidation uses a per-project `epoch` (`hub:v1:p:{id}:epoch`). Every project/source/webhook/token change writes a new epoch; old keys become unreachable and expire on TTL. No `SCAN`.
-- Session impact: new connections see changes immediately; **already-open sockets do not**. Store `auth_epoch` in the Socket.IO session, compare it on every `chat` event, and disconnect on mismatch. Also explicitly disconnect all project sockets on token rotation and source clients on source token/robot change or deletion.
-- Fail-closed for security-sensitive writes when Redis is enabled but unavailable (token rotation, webhook change, source change/delete → `503`, no MySQL change), configurable via `HUB_CACHE_STRICT`. Reads may fail open to MySQL.
-- Add per-key in-process single-flight locks (Hub is single-instance) to avoid stampedes. Webhook URL changes affect the next delivery only; an in-flight POST cannot be cancelled.
-- Requires adding `redis>=5,<6` to `requirements.txt`; Redis must be private/authenticated because it holds `webhook_secret` and `client_key`.
+- Invalidation uses a per-project `epoch` (`hub:v1:p:{id}:epoch`). Mutations rotate it **before and after** the MySQL write so a concurrent read cannot keep pre-write data under the new epoch. No `SCAN`.
+- Session impact: `auth_epoch` (project) and `source_epoch` (client source) are stored in Socket.IO sessions and checked on every `chat` event; mismatch returns `chat_error` with `session_expired` and disconnects. Token rotation disconnects all project sockets; source token/robot change or deletion disconnects matching clients. Source epochs are separate so source changes do not invalidate operators.
+- Fail-closed for security-sensitive writes when Redis is enabled but unavailable (token rotation, webhook change, source create/change/delete → `503`, no MySQL change), configurable via `HUB_CACHE_STRICT`. Reads fail open to MySQL.
+- Per-key in-process single-flight locks avoid stampedes (Hub is single-instance). A webhook URL change affects the next delivery only; an in-flight POST cannot be cancelled.
+- `redis>=5,<6` is in `requirements.txt`. Redis must be private/authenticated because it holds `webhook_secret` and `client_key`.
 
 ---
 
@@ -457,6 +505,8 @@ Documented in `docs/architecture.md` §10. MySQL stays the source of truth; Redi
 - **Source token update:** clear `webhook_secret` and `last_update_id` when token/robot changes. Otherwise old-bot updates are misattributed and new-bot update IDs may be dropped by the old cursor.
 - **Do not log the webhook URL:** it contains the only authentication secret. Aiohttp access log is off; error middleware masks the path.
 - **Dedup cursor advances only after Hub ACK.** If ACK is lost, duplicates are possible. Planet must tolerate duplicate messages.
+- **A failed update ID must survive later successes.** Track failed IDs in a short-lived window (Redis/in-memory); otherwise a later success advances the cursor and the retry of the failed ID is silently dropped as a duplicate.
+- **Never drop a retry when the failed-update window is unknown.** If Redis is enabled but unavailable, process the retry (duplicate possible) instead of treating it as a duplicate; loss is worse than a duplicate here.
 - **Bale caption limit is 1,024**, not 4,096. Split captions separately.
 - **Bale `file_id` is bot-specific.** Do not reuse across bots.
 - **`update_id` is per bot.** Reset it on bot token/robot changes.
@@ -469,6 +519,21 @@ Documented in `docs/architecture.md` §10. MySQL stays the source of truth; Redi
 - **Operator reply does not create a conversation room for Bale**; `user_id` is the Bale chat ID and the bridge is the only delivery path.
 - **Queue ordering is per bot**, not global. Cross-bot ordering is irrelevant.
 - **429 handling:** one retry only, bounded by `retry_after`; do not loop forever.
+- **Cache invalidation must rotate the epoch twice:** before the MySQL write (fail-closed) and after it (cleanup of reads that raced with the write). Rotating only once leaves a stale-cache window.
+- **Source negative keys are not epoch-scoped:** a missing source has no `project_id`, so `invalidate_source_cache` explicitly deletes `neg:src:*` and `neg:chat:*` keys. Do not rely on epoch for those.
+- **Keep project and source auth epochs separate:** rotating the project epoch on every source change would expire operator sessions unnecessarily. `source_epoch` covers client sockets only.
+- **`MetadataCache.start()` creates the Redis client before checking `enabled`;** `enabled` is false until a client exists. A failed ping leaves the client present so reads fail open and strict writes fail closed.
+- **Never cache raw project tokens:** token keys use `sha256(token)` and values hold only `project_id`/`epoch`; chat cache stores `client_key`.
+- **Origin is not authentication.** Any non-browser client can spoof or omit `Origin`; keep operator tokens and client signatures as the real boundaries.
+- **`HUB_ALLOWED_ORIGINS` is captured when `create_app()` runs.** Changing it requires a Hub restart, unlike cache TTLs which are read per connection.
+- **Empty `HUB_ALLOWED_ORIGINS` means same-origin only** (engine.io default). Behind a proxy that drops `Host`/`X-Forwarded-Proto`, even the operator panel is rejected with `bad-origin`.
+- **Redis is still single-instance infrastructure:** the cache does not replace the Redis Socket.IO adapter and does not allow multiple Hub processes.
+- **`file_id` is bot-specific and provider-scoped.** Never reuse a Bale `file_id` across bots/sources; the File Resolver scopes by `source + robot_id`.
+- **Never put provider download URLs in the message payload.** Bale `getFile` links expire in ~1h; store only `file_id` and resolve on demand.
+- **Keep the file cache TTL ≤ the provider link TTL.** Bale links expire in ~1h; cache bytes for 1h max and re-run `getFile` on a miss.
+- **The adapter file endpoint is private.** `/internal/files` uses `HUB_BALE_SERVICE_TOKEN` and must not be exposed by the reverse proxy; only Hub calls it.
+- **File access is project-scoped, not conversation-scoped.** Hub has no history to prove chat ownership; Planet must enforce per-conversation access if needed.
+- **Do not cache 20MB blobs in Redis.** Use the adapter's disk cache; Redis is for small metadata/URLs only.
 
 ---
 
@@ -489,13 +554,15 @@ Before finishing any change:
 
 ---
 
-## 15. Handoff snapshot (2026-11-21)
+## 15. Handoff snapshot (2026-11-22)
 
-- Phase one (internal chat + private Bale) plus the offline Planet webhook are implemented and covered by **151 tests**.
+- Phase one (internal chat + private Bale) plus the offline Planet webhook and the File Resolver are implemented and covered by **201 tests**.
+- The optional Redis metadata cache is implemented (`cache.py`, `requirements.txt`, `HUB_REDIS_URL`); it caches only metadata and invalidates with project/source epochs.
+- Token rotation disconnects all project sockets; source token/robot changes and deletions disconnect matching clients. Session epochs are checked on every `chat` event.
 - A manual E2E with real Hub + MariaDB + `bale_service` + fake Bale API passed: webhook registration, inbound relay, dedup, outbound reply.
 - Migrations `003` and `004` are applied to the local development database.
 - Base code is committed as `8f99611`; later commits include `e13d931`. Current changes are uncommitted.
 - Local `.env` still needs `HUB_BALE_SERVICE_TOKEN`, `HUB_URL`, and `BALE_PUBLIC_BASE_URL` before the Bale service can run.
 - Real Bale verification is blocked on a real bot token and a public HTTPS endpoint on port 443/88.
 - The offline Planet webhook is implemented in `webhooks.py`, `server.py`, and `database.py`; docs are updated in `docs/architecture.md` §8 and README §6.
-- Next decisions: implement the Redis metadata cache in `docs/architecture.md` §10 (epoch invalidation + socket `auth_epoch`), Planet persistence/offline policy, whether to ingest all inbound messages or only offline ones, internal-chat offline reply delivery, S3/MinIO attachments, final delivery ACK, and periodic `getWebhookInfo` verification.
+- Next decisions: Planet persistence/offline policy, whether to ingest all inbound messages or only offline ones, internal-chat offline reply delivery, S3/MinIO attachments, final delivery ACK, and periodic `getWebhookInfo` verification. Periodically review Redis hit/miss metrics and whether `HUB_CACHE_STRICT` should be enabled in production.

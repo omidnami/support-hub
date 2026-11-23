@@ -69,6 +69,11 @@ class BaleServiceConfig:
     webhook_require_https: bool
     register_webhooks: bool
     log_level: str
+    file_cache_dir: str = ""
+    file_cache_ttl: int = 3600
+    file_cache_max_bytes: int = 512 * 1024 * 1024
+    file_max_bytes: int = 20 * 1024 * 1024
+    file_download_timeout: float = 30
 
     @property
     def hub_configured(self):
@@ -107,4 +112,13 @@ def load_config():
         webhook_require_https=webhook_require_https,
         register_webhooks=register_webhooks,
         log_level=os.getenv("BALE_LOG_LEVEL", "INFO").strip().upper() or "INFO",
+        file_cache_dir=os.getenv("BALE_FILE_CACHE_DIR", "").strip(),
+        file_cache_ttl=_positive_int("BALE_FILE_CACHE_TTL", 3600),
+        file_cache_max_bytes=_positive_int(
+            "BALE_FILE_CACHE_MAX_BYTES", 512 * 1024 * 1024
+        ),
+        file_max_bytes=_positive_int(
+            "BALE_FILE_MAX_BYTES", 20 * 1024 * 1024
+        ),
+        file_download_timeout=_positive_float("BALE_FILE_DOWNLOAD_TIMEOUT", 30),
     )

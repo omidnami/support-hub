@@ -7,6 +7,7 @@ from unittest import mock
 import socketio
 from aiohttp.test_utils import TestServer
 
+import aiohttp
 import server
 
 
@@ -112,7 +113,11 @@ class SocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         server.deliver_webhook = _deliver_webhook
         self.env_patch = mock.patch.dict(
-            os.environ, {"HUB_BALE_SERVICE_TOKEN": BALE_SERVICE_TOKEN}
+            os.environ,
+            {
+                "HUB_BALE_SERVICE_TOKEN": BALE_SERVICE_TOKEN,
+                "HUB_ALLOWED_ORIGINS": "",
+            },
         )
         self.env_patch.start()
 
@@ -131,13 +136,13 @@ class SocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
         for name, function in self.original_functions.items():
             setattr(server, name, function)
 
-    def new_client(self):
-        client = socketio.AsyncClient()
+    def new_client(self, reconnection=True):
+        client = socketio.AsyncClient(reconnection=reconnection)
         self.clients.append(client)
         return client
 
-    async def connect_operator(self):
-        operator = self.new_client()
+    async def connect_operator(self, reconnection=True):
+        operator = self.new_client(reconnection=reconnection)
         authenticated = asyncio.Event()
 
         @operator.on("authenticated")
@@ -166,8 +171,9 @@ class SocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(authenticated.wait(), timeout=2)
         return bridge
 
-    async def connect_client(self, user_id="101", signature=None, expires=None):
-        client = self.new_client()
+    async def connect_client(self, user_id="101", signature=None, expires=None,
+                             reconnection=True):
+        client = self.new_client(reconnection=reconnection)
         authenticated = asyncio.Event()
 
         @client.on("authenticated")
@@ -192,6 +198,59 @@ class SocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         await asyncio.wait_for(authenticated.wait(), timeout=2)
         return client
+
+    async def _origin_handshake(self, url, origin):
+        session = aiohttp.ClientSession()
+        self.addAsyncCleanup(session.close)
+        ws_url = url.replace("https://", "wss://").replace("http://", "ws://")
+        return await session.ws_connect(
+            f"{ws_url}/socket.io/?EIO=4&transport=websocket",
+            headers={"Origin": origin},
+        )
+
+    async def test_cross_origin_rejected_by_default(self):
+        with self.assertRaises(aiohttp.WSServerHandshakeError):
+            await self._origin_handshake(self.url, "https://store.example")
+
+    async def test_configured_origins_allow_cross_origin(self):
+        with mock.patch.dict(
+            os.environ, {"HUB_ALLOWED_ORIGINS": "*"}, clear=False
+        ):
+            app, _, _ = server.create_app()
+        other_server = TestServer(app)
+        await other_server.start_server()
+        self.addAsyncCleanup(other_server.close)
+        other_url = str(other_server.make_url("/")).rstrip("/")
+
+        operator = self.new_client()
+        authenticated = asyncio.Event()
+
+        @operator.on("authenticated")
+        async def on_authenticated(data):
+            authenticated.set()
+
+        await operator.connect(
+            other_url,
+            headers={"Origin": "https://store.example"},
+            auth={"token": PROJECT_TOKEN},
+            transports=["websocket"],
+        )
+        await asyncio.wait_for(authenticated.wait(), timeout=2)
+
+    async def test_allowed_origin_list_rejects_unknown_origin(self):
+        with mock.patch.dict(
+            os.environ,
+            {"HUB_ALLOWED_ORIGINS": "https://panel.example"},
+            clear=False,
+        ):
+            app, _, _ = server.create_app()
+        other_server = TestServer(app)
+        await other_server.start_server()
+        self.addAsyncCleanup(other_server.close)
+        other_url = str(other_server.make_url("/")).rstrip("/")
+
+        with self.assertRaises(aiohttp.WSServerHandshakeError):
+            await self._origin_handshake(other_url, "https://store.example")
 
     async def test_client_message_reaches_operator_and_conversation(self):
         operator = await self.connect_operator()
@@ -226,6 +285,36 @@ class SocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received["operator"], payload)
         self.assertEqual(received["client"], payload)
         self.assertEqual(self.webhook_calls, [])
+
+    async def test_token_rotation_disconnects_open_project_sockets(self):
+        operator = await self.connect_operator(reconnection=False)
+        client = await self.connect_client(reconnection=False)
+
+        operator_gone = asyncio.Event()
+        client_gone = asyncio.Event()
+
+        @operator.on("disconnect")
+        async def on_operator_disconnect(*args):
+            operator_gone.set()
+
+        @client.on("disconnect")
+        async def on_client_disconnect(*args):
+            client_gone.set()
+
+        rotate = mock.AsyncMock(return_value="new-project-token")
+        with mock.patch.object(server, "rotate_project_token", rotate):
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.url}/api/projects/1/token",
+                    headers={"Authorization": f"Bearer {PROJECT_TOKEN}"},
+                ) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(
+                        (await response.json())["token"], "new-project-token"
+                    )
+        await asyncio.wait_for(operator_gone.wait(), timeout=2)
+        await asyncio.wait_for(client_gone.wait(), timeout=2)
+        rotate.assert_awaited_once()
 
     async def test_client_cannot_use_another_users_signature(self):
         expires = int(time.time()) + 300

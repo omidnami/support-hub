@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from config import env_flag, load_env_file, parse_env_line
+from config import env_flag, env_origins, load_env_file, parse_env_line
 from server import (
     CLIENT_TOKEN_SKEW,
     MAX_CLIENT_TOKEN_TTL,
@@ -77,6 +77,23 @@ class ConfigTests(unittest.TestCase):
             self.assertFalse(env_flag("SH_TEST_FLAG"))
         os.environ.pop("SH_TEST_FLAG", None)
         self.assertTrue(env_flag("SH_TEST_FLAG", default=True))
+
+    def test_env_origins(self):
+        with mock.patch.dict(os.environ, {"SH_TEST_ORIGINS": ""}, clear=False):
+            self.assertIsNone(env_origins("SH_TEST_ORIGINS"))
+        with mock.patch.dict(os.environ, {"SH_TEST_ORIGINS": "*"}, clear=False):
+            self.assertEqual(env_origins("SH_TEST_ORIGINS"), "*")
+        with mock.patch.dict(
+            os.environ,
+            {"SH_TEST_ORIGINS": " https://a.example , https://b.example ,"},
+            clear=False,
+        ):
+            self.assertEqual(
+                env_origins("SH_TEST_ORIGINS"),
+                ["https://a.example", "https://b.example"],
+            )
+        os.environ.pop("SH_TEST_ORIGINS", None)
+        self.assertIsNone(env_origins("SH_TEST_ORIGINS"))
 
 
 class RegistrationTests(unittest.TestCase):

@@ -1,8 +1,8 @@
 import unittest
 
 from database import (
-    delete_project_webhook, get_project_webhook, set_project_webhook,
-    update_source_token,
+    delete_project_webhook, get_project_webhook, get_source_identity,
+    set_project_webhook, update_source_token,
 )
 
 
@@ -94,6 +94,21 @@ class SourceTokenUpdateTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(connection.committed)
         self.assertEqual(connection.rollbacks, 1)
         self.assertEqual(len(cursor.queries), 1)
+
+
+class SourceIdentityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_identity_decodes_stored_values(self):
+        cursor = _Cursor((b"bale", b"987654"))
+        identity = await get_source_identity(
+            _Pool(_Connection(cursor)), 2, 1
+        )
+        self.assertEqual(identity, ("bale", "987654"))
+
+    async def test_missing_identity_returns_none(self):
+        identity = await get_source_identity(
+            _Pool(_Connection(_Cursor(None))), 2, 1
+        )
+        self.assertIsNone(identity)
 
 
 class ProjectWebhookTests(unittest.IsolatedAsyncioTestCase):

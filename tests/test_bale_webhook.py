@@ -11,6 +11,7 @@ from bale_service.config import BaleServiceConfig
 from bale_service.hub import HubRejected, HubUnavailable
 from bale_service.repository import BaleSource
 from bale_service.service import BaleService, OutboundDispatcher
+from cache import CACHE_DOWN
 
 
 SECRET = "s" * 32
@@ -134,13 +135,57 @@ class FakePool:
         return _Connection()
 
 
+class FakeCache:
+    enabled = True
+
+    def __init__(self):
+        self.values = {}
+        self.started = False
+
+    async def start(self):
+        self.started = True
+
+    async def close(self):
+        pass
+
+    async def get_json(self, key):
+        return self.values.get(key)
+
+    async def set_json(self, key, value, ttl):
+        self.values[key] = value
+        return True
+
+    async def delete(self, key):
+        self.values.pop(key, None)
+        return True
+
+
+class DownCache(FakeCache):
+    async def get_json(self, key):
+        return CACHE_DOWN
+
+
+class FlakyHub(FakeHub):
+    def __init__(self, fail_ids):
+        super().__init__()
+        self.fail_ids = set(fail_ids)
+
+    async def send_inbound(self, payload, metadata=None):
+        if metadata["update_id"] in self.fail_ids:
+            self.fail_ids.discard(metadata["update_id"])
+            raise HubUnavailable("temporary")
+        self.sent.append(payload)
+        self.metadata.append(metadata)
+
+
 class BaleWebhookTests(unittest.IsolatedAsyncioTestCase):
-    def make_service(self, hub=None, config=None):
+    def make_service(self, hub=None, config=None, cache=None):
         return BaleService(
             config or make_config(),
             pool=FakePool(),
             api=FakeAPI(),
             hub=hub or FakeHub(),
+            cache=cache,
         )
 
     async def post(self, service, body=None, raw=None, secret=SECRET, max_size=None):
@@ -200,6 +245,104 @@ class BaleWebhookTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body, {"ok": True})
         self.assertEqual(hub.sent, [])
         advance.assert_not_awaited()
+
+    async def test_failed_update_can_be_retried_after_a_later_success(self):
+        hub = FlakyHub({10})
+        service = self.make_service(hub)
+        state = {"cursor": 9}
+
+        async def find(pool, secret):
+            return make_source(last_update_id=state["cursor"])
+
+        async def advance(pool, source_id, update_id):
+            if state["cursor"] is None or state["cursor"] < update_id:
+                state["cursor"] = update_id
+                return True
+            return False
+
+        with mock.patch(
+            "bale_service.service.find_source_by_secret", new=find,
+        ), mock.patch(
+            "bale_service.service.advance_last_update_id",
+            new=mock.AsyncMock(side_effect=advance),
+        ) as advance_mock:
+            status, _ = await self.post(service, make_update(update_id=10))
+            self.assertEqual(status, 503)
+            status, _ = await self.post(service, make_update(update_id=11))
+            self.assertEqual(status, 200)
+            status, _ = await self.post(service, make_update(update_id=10))
+            self.assertEqual(status, 200)
+
+        self.assertEqual(
+            [item["user_id"] for item in hub.sent], ["42", "42"]
+        )
+        self.assertEqual(hub.metadata[-1]["update_id"], 10)
+        self.assertEqual(state["cursor"], 11)
+        advance_mock.assert_awaited_once_with(service.pool, 1, 11)
+
+    async def test_retry_below_cursor_without_failure_is_a_duplicate(self):
+        hub = FakeHub()
+        service = self.make_service(hub)
+        source = make_source(last_update_id=11)
+        with mock.patch(
+            "bale_service.service.find_source_by_secret",
+            new=mock.AsyncMock(return_value=source),
+        ), mock.patch(
+            "bale_service.service.advance_last_update_id",
+            new=mock.AsyncMock(return_value=True),
+        ) as advance:
+            status, _ = await self.post(service, make_update(update_id=10))
+        self.assertEqual(status, 200)
+        self.assertEqual(hub.sent, [])
+        advance.assert_not_awaited()
+
+    async def test_unavailable_cache_does_not_drop_retry(self):
+        hub = FakeHub()
+        service = self.make_service(hub, cache=DownCache())
+        source = make_source(last_update_id=11)
+        with mock.patch(
+            "bale_service.service.find_source_by_secret",
+            new=mock.AsyncMock(return_value=source),
+        ), mock.patch(
+            "bale_service.service.advance_last_update_id",
+            new=mock.AsyncMock(return_value=False),
+        ):
+            status, _ = await self.post(service, make_update(update_id=10))
+        self.assertEqual(status, 200)
+        self.assertEqual(hub.metadata[0]["update_id"], 10)
+
+    async def test_failed_update_survives_restart_with_cache(self):
+        cache = FakeCache()
+        first = self.make_service(FlakyHub({10}), cache=cache)
+        state = {"cursor": 9}
+
+        async def find(pool, secret):
+            return make_source(last_update_id=state["cursor"])
+
+        with mock.patch(
+            "bale_service.service.find_source_by_secret", new=find,
+        ), mock.patch(
+            "bale_service.service.advance_last_update_id",
+            new=mock.AsyncMock(return_value=False),
+        ):
+            status, _ = await self.post(first, make_update(update_id=10))
+        self.assertEqual(status, 503)
+        self.assertTrue(cache.values)
+
+        # A later update succeeded, then the service restarted before the retry.
+        state["cursor"] = 11
+        hub = FakeHub()
+        second = self.make_service(hub, cache=cache)
+        with mock.patch(
+            "bale_service.service.find_source_by_secret", new=find,
+        ), mock.patch(
+            "bale_service.service.advance_last_update_id",
+            new=mock.AsyncMock(return_value=False),
+        ):
+            status, _ = await self.post(second, make_update(update_id=10))
+        self.assertEqual(status, 200)
+        self.assertEqual(hub.metadata[0]["update_id"], 10)
+        self.assertEqual(cache.values, {})
 
     async def test_ignored_update_still_advances_the_cursor(self):
         hub = FakeHub()

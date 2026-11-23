@@ -1,16 +1,20 @@
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
+import mimetypes
 import re
 from dataclasses import replace
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from aiohttp import web
 
 from database import open_database
 
-from .api import BaleAPI, BaleError
+from .api import BaleAPI, BaleError, BaleUnavailable, FileTooLarge
 from .config import BaleServiceConfig
+from .files import FileCache
 from .hub import HubBridge, HubRejected, HubUnavailable
 from .mapping import build_client_payload
 from .repository import (
@@ -18,10 +22,58 @@ from .repository import (
     find_source_by_secret, list_bale_sources,
 )
 
+try:  # cache.py is optional at deploy time; the service also runs without it.
+    from cache import CACHE_DOWN
+except ImportError:  # pragma: no cover
+    CACHE_DOWN = object()
+
 
 logger = logging.getLogger("support_hub.bale")
 WEBHOOK_PATH = "/webhooks/bale"
 SECRET_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,64}$")
+FAILED_TTL = 24 * 60 * 60
+FAILED_LIMIT = 2000
+BALE_FILE_LIMIT = 20 * 1024 * 1024
+
+
+def _valid_text(value, limit):
+    if not isinstance(value, str):
+        return False
+    value = value.strip()
+    if not value or len(value) > limit:
+        return False
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _safe_file_name(file_path, key):
+    name = unquote(str(file_path).rsplit("/", 1)[-1]) or f"{key}.bin"
+    name = "".join(
+        char for char in name if char >= " " and char not in '"\\'
+    )
+    return name[:200] or f"{key}.bin"
+
+
+def _content_disposition(file_name):
+    ascii_name = "".join(
+        char if 32 <= ord(char) < 127 and char not in '"\\' else "_"
+        for char in str(file_name)
+    )[:200] or "file"
+    encoded = quote(str(file_name), safe="")
+    return f'inline; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded}'
+
+
+def _secret_digest(secret):
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def _failed_key(secret):
+    return f"hub:v1:bale:failed:{_secret_digest(secret)}"
 
 
 class SourceNotFound(LookupError):
@@ -92,11 +144,22 @@ class OutboundDispatcher:
 
 
 class BaleService:
-    def __init__(self, config: BaleServiceConfig, *, pool=None, api=None, hub=None):
+    def __init__(self, config: BaleServiceConfig, *, pool=None, api=None, hub=None,
+                 cache=None, file_cache=None):
         self.config = config
         self.pool = pool
         self._owns_pool = pool is None
-        self.api = api or BaleAPI(config.bale_api_base, timeout=config.request_timeout)
+        self.cache = cache
+        self.file_cache = file_cache or FileCache(
+            config.file_cache_dir,
+            ttl=config.file_cache_ttl,
+            max_bytes=config.file_cache_max_bytes,
+        )
+        self._file_locks = {}
+        self.api = api or BaleAPI(
+            config.bale_api_base, timeout=config.request_timeout,
+            download_timeout=config.file_download_timeout,
+        )
         self._owns_api = api is None
         self.hub = hub or HubBridge(
             config.hub_url, config.hub_service_token,
@@ -111,8 +174,15 @@ class BaleService:
         self._sources_by_id = {}
         self._registered = {}
         self._locks = {}
+        # Update IDs whose delivery failed are temporarily remembered so a
+        # later successful update cannot make them look like duplicates.
+        self._failed_updates = {}
+        self._failed_incomplete = set()
 
     async def start(self):
+        if self.cache is not None:
+            await self.cache.start()
+        await asyncio.to_thread(self.file_cache.cleanup)
         if self.pool is None:
             self.pool = await open_database()
         await self._refresh_sources()
@@ -143,6 +213,8 @@ class BaleService:
             self.pool.close()
             await self.pool.wait_closed()
             self.pool = None
+        if self.cache is not None:
+            await self.cache.close()
 
     async def _refresh_sources(self):
         rows = await list_bale_sources(self.pool)
@@ -299,34 +371,100 @@ class BaleService:
             logger.warning("Could not queue operator reply for Bale source %s.",
                            payload.get("robot_id"))
 
-    async def process_update(self, secret, update_id, update):
-        source = await find_source_by_secret(self.pool, secret)
-        if source is None:
-            raise SourceNotFound()
-        lock = self._locks.setdefault(source.id, asyncio.Lock())
-        async with lock:
-            source = await find_source_by_secret(self.pool, secret)
-            if source is None:
-                raise SourceNotFound()
-            if source.last_update_id is not None \
-                    and update_id <= source.last_update_id:
-                return "duplicate"
+    async def _failed_for(self, secret):
+        """Return (key, failed IDs, whether the set is known to be complete)."""
+        key = _failed_key(secret)
+        failed = self._failed_updates.get(key)
+        if failed is not None and key not in self._failed_incomplete:
+            return key, failed, True
+        if failed is None:
+            failed = set()
+        known = True
+        if self.cache is not None and self.cache.enabled:
+            stored = await self.cache.get_json(key)
+            if stored is CACHE_DOWN:
+                self._failed_incomplete.add(key)
+                known = False
+            else:
+                self._failed_incomplete.discard(key)
+                if isinstance(stored, list):
+                    failed.update(
+                        item for item in stored
+                        if type(item) is int and item >= 0
+                    )
+        self._failed_updates[key] = failed
+        return key, failed, known
 
-            payload = build_client_payload(update, source.robot_id)
-            if payload is None:
-                await advance_last_update_id(self.pool, source.id, update_id)
-                return "ignored"
+    async def _save_failed(self, key, failed):
+        if self.cache is None or not self.cache.enabled:
+            return
+        if failed:
+            await self.cache.set_json(key, sorted(failed), FAILED_TTL)
+        else:
+            await self.cache.delete(key)
 
-            await self.hub.send_inbound(
-                payload,
-                {"update_id": update_id, "chat_id": payload["user_id"]},
+    async def _mark_failed(self, secret, update_id):
+        key, failed, _ = await self._failed_for(secret)
+        failed.add(update_id)
+        if len(failed) > FAILED_LIMIT:
+            failed.difference_update(
+                sorted(failed)[:len(failed) - FAILED_LIMIT]
             )
-            if not await advance_last_update_id(self.pool, source.id, update_id):
-                logger.warning(
-                    "Bale update %s for source %s was forwarded but the dedup cursor "
-                    "did not advance.", update_id, source.id,
+        await self._save_failed(key, failed)
+
+    async def _clear_failed(self, secret, update_id):
+        key = _failed_key(secret)
+        failed = self._failed_updates.get(key)
+        if failed is None or update_id not in failed:
+            return
+        failed.discard(update_id)
+        await self._save_failed(key, failed)
+
+    async def process_update(self, secret, update_id, update):
+        lock = self._locks.setdefault(_secret_digest(secret), asyncio.Lock())
+        async with lock:
+            try:
+                source = await find_source_by_secret(self.pool, secret)
+                if source is None:
+                    raise SourceNotFound()
+                if source.last_update_id is not None \
+                        and update_id <= source.last_update_id:
+                    _, failed, known = await self._failed_for(secret)
+                    if known and update_id not in failed:
+                        return "duplicate"
+
+                payload = build_client_payload(update, source.robot_id)
+                if payload is None:
+                    await self._clear_failed(secret, update_id)
+                    if source.last_update_id is None \
+                            or update_id > source.last_update_id:
+                        await advance_last_update_id(
+                            self.pool, source.id, update_id
+                        )
+                    return "ignored"
+
+                await self.hub.send_inbound(
+                    payload,
+                    {"update_id": update_id, "chat_id": payload["user_id"]},
                 )
-            return "forwarded"
+                await self._clear_failed(secret, update_id)
+                if source.last_update_id is None \
+                        or update_id > source.last_update_id:
+                    if not await advance_last_update_id(
+                            self.pool, source.id, update_id):
+                        logger.warning(
+                            "Bale update %s for source %s was forwarded but the dedup "
+                            "cursor did not advance.", update_id, source.id,
+                        )
+                return "forwarded"
+            except SourceNotFound:
+                raise
+            except Exception:
+                # Remember any update we could not deliver. Otherwise a later
+                # success moves the cursor past it and its retry looks like a
+                # duplicate. Marking happens inside the per-secret lock.
+                await self._mark_failed(secret, update_id)
+                raise
 
     async def handle_webhook(self, request):
         secret = request.match_info.get("secret", "")
@@ -366,6 +504,83 @@ class BaleService:
             return web.json_response({"ok": False}, status=500)
         logger.debug("Bale update %s handled: %s.", update_id, outcome)
         return web.json_response({"ok": True})
+
+    def _file_authorized(self, header):
+        if not isinstance(header, str) or not header.startswith("Bearer "):
+            return False
+        token = header[7:]
+        expected = self.config.hub_service_token
+        if not expected or not token.isascii() or not expected.isascii():
+            return False
+        return hmac.compare_digest(token, expected)
+
+    @staticmethod
+    def _file_response(path, meta):
+        name = meta.get("file_name") or path.name
+        return web.FileResponse(
+            path,
+            headers={
+                "Content-Type": meta.get("content_type")
+                or "application/octet-stream",
+                "Content-Disposition": _content_disposition(name),
+                "Cache-Control": "private, max-age=300",
+            },
+        )
+
+    async def handle_file(self, request):
+        if not self._file_authorized(request.headers.get("Authorization", "")):
+            return web.json_response({"ok": False}, status=401)
+        source = request.query.get("source", "")
+        robot_id = request.query.get("robot_id", "").strip()
+        file_id = request.query.get("file_id", "").strip()
+        if source != "bale" or not _valid_text(robot_id, 255) \
+                or not _valid_text(file_id, 4096):
+            return web.json_response({"ok": False}, status=400)
+
+        source_row = await find_source_by_robot(self.pool, robot_id)
+        if source_row is None:
+            return web.json_response({"ok": False}, status=404)
+
+        key = FileCache.key(robot_id, file_id)
+        cached = await asyncio.to_thread(self.file_cache.get, key)
+        if cached is not None:
+            return self._file_response(*cached)
+
+        lock = self._file_locks.setdefault(key, asyncio.Lock())
+        try:
+            async with lock:
+                cached = await asyncio.to_thread(self.file_cache.get, key)
+                if cached is not None:
+                    return self._file_response(*cached)
+                max_bytes = min(self.config.file_max_bytes, BALE_FILE_LIMIT)
+                try:
+                    info = await self.api.get_file(source_row.token, file_id)
+                    data, content_type = await self.api.download_file(
+                        source_row.token, info["file_path"], max_bytes
+                    )
+                except FileTooLarge:
+                    return web.json_response({"ok": False}, status=413)
+                except BaleUnavailable:
+                    return web.json_response({"ok": False}, status=502)
+                except BaleError as exc:
+                    status = 404 if exc.status in (400, 404) else 502
+                    return web.json_response({"ok": False}, status=status)
+
+                file_name = _safe_file_name(info.get("file_path"), key)
+                if content_type == "application/octet-stream":
+                    guessed, _ = mimetypes.guess_type(file_name)
+                    if guessed:
+                        content_type = guessed
+                await asyncio.to_thread(
+                    self.file_cache.put, key, data, content_type, file_name
+                )
+                return self._file_response(
+                    self.file_cache.path(key),
+                    {"content_type": content_type, "file_name": file_name},
+                )
+        finally:
+            if len(self._file_locks) > 1000:
+                self._file_locks.clear()
 
     async def healthz(self, _request):
         database_ok = True
@@ -411,6 +626,7 @@ def create_app(service):
         client_max_size=service.config.max_update_bytes,
     )
     app.router.add_post(f"{WEBHOOK_PATH}/{{secret}}", service.handle_webhook)
+    app.router.add_get("/internal/files", service.handle_file)
     app.router.add_get("/healthz", service.healthz)
 
     async def lifecycle(_app):
@@ -424,6 +640,14 @@ def create_app(service):
     return app
 
 
+def _cache_from_env():
+    try:
+        from cache import MetadataCache
+    except ImportError:  # pragma: no cover - cache.py is optional at deploy time
+        return None
+    return MetadataCache.from_env()
+
+
 def main():
     from .config import load_config
 
@@ -433,7 +657,7 @@ def main():
         level=level if isinstance(level, int) else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    service = BaleService(config)
+    service = BaleService(config, cache=_cache_from_env())
     app = create_app(service)
     # The default access log would print the webhook secret on every update.
     web.run_app(app, host=config.host, port=config.port, access_log=None)

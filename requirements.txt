@@ -2,3 +2,4 @@ python-socketio>=5.12,<6
 aiohttp>=3.10,<4
 aiomysql>=0.2,<1
 PyMySQL>=1.0,<2
+redis>=5,<6

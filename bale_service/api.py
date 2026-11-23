@@ -21,6 +21,10 @@ class BaleUnavailable(BaleError):
     """A temporary network/platform failure."""
 
 
+class FileTooLarge(BaleError):
+    """The provider file exceeds the configured download limit."""
+
+
 def split_text(text, limit=MAX_MESSAGE_LENGTH):
     """Split long text into Bale-sized chunks, preferring line boundaries."""
     if len(text) <= limit:
@@ -38,6 +42,16 @@ def split_text(text, limit=MAX_MESSAGE_LENGTH):
     if remaining:
         chunks.append(remaining)
     return chunks
+
+
+FILE_METHODS = {
+    "photo": ("sendPhoto", "photo"),
+    "voice": ("sendVoice", "voice"),
+    "audio": ("sendAudio", "audio"),
+    "video": ("sendVideo", "video"),
+    "animation": ("sendAnimation", "animation"),
+    "document": ("sendDocument", "document"),
+}
 
 
 def _file_reference(file):
@@ -58,15 +72,18 @@ def _file_reference(file):
         reference = file_id if isinstance(file_id, str) and file_id else url
         if not isinstance(reference, str) or not reference.strip():
             raise ValueError("File object needs file_id or url.")
-        kind = "photo" if file.get("type") == "photo" else "document"
+        kind = file.get("type")
+        if kind not in FILE_METHODS:
+            kind = "document"
         return kind, reference
     raise ValueError("Unsupported file payload.")
 
 
 class BaleAPI:
-    def __init__(self, base_url, timeout=15, session=None):
+    def __init__(self, base_url, timeout=15, session=None, download_timeout=60):
         self.base_url = base_url.rstrip("/")
         self.timeout = aiohttp.ClientTimeout(total=timeout)
+        self.download_timeout = download_timeout
         self._session = session
         self._owns_session = session is None
 
@@ -140,6 +157,52 @@ class BaleAPI:
     async def get_webhook_info(self, token):
         return await self._call(token, "getWebhookInfo")
 
+    async def get_file(self, token, file_id):
+        result = await self._call(token, "getFile", {"file_id": file_id})
+        if not isinstance(result, dict):
+            raise BaleError("Bale did not return file metadata.")
+        file_path = result.get("file_path")
+        if not isinstance(file_path, str) or not file_path.strip():
+            raise BaleError("Bale did not return a file path.")
+        return result
+
+    async def download_file(self, token, file_path, max_bytes):
+        """Download a provider file into memory, enforcing a size limit."""
+        url = (
+            f"{self.base_url}/file/bot{quote(token, safe=':')}/"
+            f"{quote(file_path, safe='/')}"
+        )
+        timeout = aiohttp.ClientTimeout(total=self.download_timeout)
+        try:
+            async with self.session.get(url, timeout=timeout) as response:
+                if response.status != 200:
+                    raise BaleError(
+                        "Bale rejected the file download.",
+                        status=response.status,
+                    )
+                length = response.headers.get("Content-Length")
+                if length:
+                    try:
+                        if int(length) > max_bytes:
+                            raise FileTooLarge("File is too large.")
+                    except ValueError:
+                        pass
+                data = bytearray()
+                async for chunk in response.content.iter_chunked(65536):
+                    data.extend(chunk)
+                    if len(data) > max_bytes:
+                        raise FileTooLarge("File is too large.")
+                content_type = response.headers.get(
+                    "Content-Type", "application/octet-stream"
+                ).split(";", 1)[0].strip()
+                return bytes(data), content_type or "application/octet-stream"
+        except FileTooLarge:
+            raise
+        except BaleError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+            raise BaleUnavailable("Could not download the Bale file.") from exc
+
     async def send_text(self, token, chat_id, text):
         if not isinstance(text, str) or not text.strip():
             raise ValueError("Text message is empty.")
@@ -155,8 +218,7 @@ class BaleAPI:
         caption = text if isinstance(text, str) else ""
         # Bale accepts shorter captions than normal messages.
         chunks = split_text(caption, MAX_CAPTION_LENGTH) if caption.strip() else []
-        method = "sendPhoto" if kind == "photo" else "sendDocument"
-        field = "photo" if kind == "photo" else "document"
+        method, field = FILE_METHODS.get(kind, ("sendDocument", "document"))
         result = None
         if chunks:
             result = await self._call(
