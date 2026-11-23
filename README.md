@@ -1065,6 +1065,8 @@ Authorization: Bearer PROJECT_TOKEN
 - پاسخ stream فایل است؛ خطاها: `400/404/410/413/502/503`.
 - محدودیت‌ها: بله حداکثر **۲۰MB** برای دانلود؛ کش موقت آداپتور **۱ ساعت**.
 - UI باید با `fetch` و هدر Authorization فایل را بگیرد و به‌صورت blob URL نمایش دهد؛ `<img src>` مستقیم بدون هدر کار نمی‌کند.
+- CORS برای `/api/files` پشتیبانی می‌شود: درخواست `OPTIONS` (preflight) و پاسخ‌ها بر اساس همان `HUB_ALLOWED_ORIGINS` هدر می‌گیرند. با `*` همهٔ دامنه‌های فروشگاه مجازند؛ با لیست، فقط Originهای دقیق. هدر `Authorization` مجاز است و از cookie استفاده نمی‌شود.
+- این endpoint با **Project Token** است؛ ویجت عمومی مشتری نباید توکن پروژه داشته باشد. فایل‌های چت داخلی از `file.url` پلتفرم (Planet) خوانده می‌شوند، نه از Hub.
 - برای `source=chat` فایل روی Planet است و باید از `file.url` خوانده شود؛ Hub فایلی برای chat ذخیره یا proxy نمی‌کند.
 - دسترسی فایل در سطح **پروژه** است، نه گفتگو؛ Planet باید در صورت نیاز مجوز گفتگویی را اعمال کند.
 - مسیر داخلی `GET /internal/files` فقط با `HUB_BALE_SERVICE_TOKEN` و روی شبکهٔ خصوصی است؛ آن را در Reverse Proxy عمومی expose نکن.
@@ -1113,7 +1115,7 @@ Authorization: Bearer PROJECT_TOKEN
 
 | متغیر | کاربرد |
 |---|---|
-| `HUB_ALLOWED_ORIGINS` | Originهای مجاز سوکت؛ `*` همه، خالی same-origin، یا فهرست کاماجدا. تغییر آن نیازمند restart است. |
+| `HUB_ALLOWED_ORIGINS` | Originهای مجاز سوکت **و CORS فایل**؛ `*` همه، خالی same-origin، یا فهرست کاماجدا. تغییر آن نیازمند restart است. |
 | `HUB_TRUST_PROXY` | فقط پشت پروکسی معتبر `1` شود تا rate limit از `X-Forwarded-For` بخواند. |
 | `HUB_BALE_SERVICE_TOKEN` | توکن bridge و همچنین احراز هویت داخلی فایل. |
 | `BALE_SERVICE_URL` | آدرس داخلی آداپتور بله برای `/api/files`؛ عمومی نشود. |
@@ -1130,6 +1132,7 @@ Reverse Proxy باید:
 ### ۹.۷. تغییرات این نسخه (برای Git/Release Notes)
 
 - **File Resolver اضافه شد:** `GET /api/files` در Hub و `GET /internal/files` در آداپتور بله.
+- **CORS فایل:** preflight و پاسخ‌های `/api/files` با `HUB_ALLOWED_ORIGINS` هماهنگ شدند؛ برای ویجت/پنل روی دامنهٔ فروشگاه لازم است.
 - **قرارداد هفت‌فیلدی پیام تغییر نکرد.** فایل همچنان داخل فیلد `file` است؛ فقط URL موقت provider در پیام قرار نمی‌گیرد.
 - **قالب ثابت `file`** برای همهٔ providerها: `provider`, `type`, `file_id`, `file_name`, `mime_type`, `file_size`, `duration`, ...
 - **کش موقت فایل** در آداپتور با TTL و سقف حجم؛ Hub فایل را دائمی ذخیره نمی‌کند. هیچ migration دیتابیسی لازم نیست.
@@ -1137,7 +1140,7 @@ Reverse Proxy باید:
 - **Origin سوکت قابل تنظیم شد:** `HUB_ALLOWED_ORIGINS` (در `.env.example` مقدار `*` دارد). قبلاً فقط same-origin بود.
 - **دریافت پیام ناموفق بله گم نمی‌شود:** IDهای ناموفق در Redis/حافظه نگه داشته می‌شوند و موفقیت پیام بعدی باعث حذف آن‌ها نمی‌شود.
 - **کش Redis اختیاری** برای metadata و epochهای session؛ بدون Redis هیچ قابلیت پیامی از دست نمی‌رود.
-- تست‌ها: `python -m unittest discover -s tests` (۲۰۱ تست در این نسخه).
+- تست‌ها: `python -m unittest discover -s tests` (۲۰۴ تست در این نسخه).
 
 ### ۹.۸. چک‌لیست اتصال یک فروشگاه جدید
 

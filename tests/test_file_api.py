@@ -70,6 +70,7 @@ class FileApiTests(unittest.IsolatedAsyncioTestCase):
                 "BALE_SERVICE_URL": adapter_url,
                 "HUB_FILE_TIMEOUT": "5",
                 "HUB_REDIS_URL": "",
+                "HUB_ALLOWED_ORIGINS": "*",
             },
         )
         self.env.start()
@@ -97,8 +98,10 @@ class FileApiTests(unittest.IsolatedAsyncioTestCase):
         for name, function in self.original_functions.items():
             setattr(server, name, function)
 
-    async def get(self, *, token=PROJECT_TOKEN, **params):
+    async def get(self, *, token=PROJECT_TOKEN, origin=None, **params):
         headers = {"Authorization": f"Bearer {token}"} if token else {}
+        if origin:
+            headers["Origin"] = origin
         return await self.client.get(
             "/api/files",
             params={
@@ -165,3 +168,84 @@ class FileApiTests(unittest.IsolatedAsyncioTestCase):
                 self.adapter.status = adapter_status
                 response = await self.get()
                 self.assertEqual(response.status, expected)
+
+    async def test_cors_preflight_for_store_origin(self):
+        response = await self.client.options(
+            "/api/files",
+            headers={
+                "Origin": "https://store.example",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "authorization",
+            },
+        )
+        self.assertEqual(response.status, 204)
+        self.assertEqual(
+            response.headers["Access-Control-Allow-Origin"], "*"
+        )
+        self.assertEqual(
+            response.headers["Access-Control-Allow-Methods"], "GET, OPTIONS"
+        )
+        self.assertIn(
+            "Authorization", response.headers["Access-Control-Allow-Headers"]
+        )
+
+    async def test_cors_headers_on_stream_and_errors(self):
+        response = await self.get(origin="https://store.example")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            response.headers["Access-Control-Allow-Origin"], "*"
+        )
+        self.assertIn(
+            "Content-Disposition",
+            response.headers["Access-Control-Expose-Headers"],
+        )
+
+        response = await self.get(
+            token=None, origin="https://store.example"
+        )
+        self.assertEqual(response.status, 401)
+        self.assertEqual(
+            response.headers["Access-Control-Allow-Origin"], "*"
+        )
+
+    async def test_cors_reflects_configured_allowlist(self):
+        with mock.patch.dict(
+            os.environ, {"HUB_ALLOWED_ORIGINS": "https://store.example"},
+            clear=False,
+        ):
+            app, _, _ = server.create_app()
+        other_server = TestServer(app)
+        await other_server.start_server()
+        self.addAsyncCleanup(other_server.close)
+        client = TestClient(other_server)
+        await client.start_server()
+        self.addAsyncCleanup(client.close)
+
+        params = {
+            "source": "bale",
+            "robot_id": ROBOT_ID,
+            "file_id": "AgAC-file",
+        }
+        response = await client.get(
+            "/api/files",
+            params=params,
+            headers={
+                "Authorization": f"Bearer {PROJECT_TOKEN}",
+                "Origin": "https://store.example",
+            },
+        )
+        self.assertEqual(
+            response.headers["Access-Control-Allow-Origin"],
+            "https://store.example",
+        )
+        self.assertEqual(response.headers["Vary"], "Origin")
+
+        response = await client.get(
+            "/api/files",
+            params=params,
+            headers={
+                "Authorization": f"Bearer {PROJECT_TOKEN}",
+                "Origin": "https://other.example",
+            },
+        )
+        self.assertNotIn("Access-Control-Allow-Origin", response.headers)

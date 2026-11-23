@@ -621,6 +621,45 @@ def create_app(cache=None):
                 return forwarded.split(",")[0].strip()
         return request.remote or "unknown"
 
+    def file_cors_origin(request):
+        origin = request.headers.get("Origin")
+        if not origin:
+            return None
+        if allowed_origins == "*":
+            return "*"
+        if isinstance(allowed_origins, list):
+            return origin if origin in allowed_origins else None
+        host = request.headers.get("Host", "")
+        scheme = request.headers.get(
+            "X-Forwarded-Proto", request.scheme
+        ).split(",")[0].strip()
+        if host and origin == f"{scheme}://{host}":
+            return origin
+        forwarded_host = request.headers.get(
+            "X-Forwarded-Host", ""
+        ).split(",")[0].strip()
+        if forwarded_host and origin == f"{scheme}://{forwarded_host}":
+            return origin
+        return None
+
+    async def file_cors_headers(request, response):
+        if request.path != "/api/files":
+            return
+        origin = file_cors_origin(request)
+        if origin is None:
+            return
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = (
+            "Authorization, Content-Type"
+        )
+        response.headers["Access-Control-Expose-Headers"] = (
+            "Content-Disposition, Content-Length"
+        )
+        response.headers["Access-Control-Max-Age"] = "600"
+        if origin != "*":
+            response.headers["Vary"] = "Origin"
+
     @web.middleware
     async def error_middleware(request, handler):
         try:
@@ -661,9 +700,11 @@ def create_app(cache=None):
         return await handler(request)
 
     app = web.Application(middlewares=[error_middleware, rate_limit_middleware])
+    app.on_response_prepare.append(file_cors_headers)
+    allowed_origins = env_origins()
     sio = socketio.AsyncServer(
         async_mode="aiohttp", transports=["websocket"],
-        cors_allowed_origins=env_origins(),
+        cors_allowed_origins=allowed_origins,
     )
     sio.attach(app)
 
@@ -968,6 +1009,9 @@ def create_app(cache=None):
             headers={"Cache-Control": "no-store"},
         )
 
+    async def file_preflight(_request):
+        return web.Response(status=204)
+
     async def download_file(request):
         project_id, error = await require_project(request)
         if error:
@@ -1134,6 +1178,7 @@ def create_app(cache=None):
     app.router.add_delete("/api/projects/{project_id}/webhook", remove_webhook)
     app.router.add_get("/api/projects/{project_id}/client-key", client_key)
     app.router.add_get("/api/files", download_file)
+    app.router.add_options("/api/files", file_preflight)
     app.router.add_post("/api/sources", add_source)
     app.router.add_patch("/api/sources/{source_id}", edit_source)
     app.router.add_delete("/api/sources/{source_id}", remove_source)

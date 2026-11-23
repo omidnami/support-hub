@@ -536,7 +536,7 @@ HUB_CACHE_TTL_NEGATIVE=60
 ```
 
 - `HUB_WEBHOOK_ALLOW_HTTP` و `HUB_WEBHOOK_ALLOW_PRIVATE` فقط برای توسعه محلی‌اند. در production هر دو باید `0` باشند.
-- `HUB_ALLOWED_ORIGINS` سیاست Origin سوکت‌ها را تعیین می‌کند: `*` هر Origin، مقدار خالی same-origin، یا فهرست کاماجدا شده. Origin احراز هویت نیست؛ اپراتور با توکن پروژه و کلاینت چت با امضای `robot_id + user_id` تأیید می‌شود.
+- `HUB_ALLOWED_ORIGINS` سیاست Origin سوکت‌ها و CORS مسیر `/api/files` را تعیین می‌کند: `*` هر Origin، مقدار خالی same-origin، یا فهرست کاماجدا شده. Origin احراز هویت نیست؛ اپراتور با توکن پروژه و کلاینت چت با امضای `robot_id + user_id` تأیید می‌شود.
 - `HUB_WEBHOOK_TIMEOUT` ثانیه است؛ مقدار پیش‌فرض ۵ و سقف ۳۰.
 - `BALE_SERVICE_URL` فقط برای شبکهٔ خصوصی است (پیش‌فرض `http://127.0.0.1:8766`). Hub از این آدرس فایل‌ها را از آداپتر بله می‌گیرد؛ این مسیر نباید از اینترنت قابل دسترس باشد.
 - `HUB_FILE_TIMEOUT` مهلت خواندن هر بخش از فایل در Hub (ثانیه، پیش‌فرض ۳۰) است.
@@ -789,6 +789,8 @@ Authorization: Bearer PROJECT_TOKEN
 - پاسخ موفق: بدنهٔ فایل به‌صورت stream با `Content-Type` و در صورت وجود `Content-Length` و `Content-Disposition`.
 - خطاها: `400` ورودی نامعتبر، `404` فایل/منبع ناشناس، `410` فایل منقضی یا غیرقابل دریافت، `413` حجم بیش از حد، `502` خطای آداپتور/provider، `503` آداپتور در دسترس نیست.
 - برای `source=chat`، فایل باید از `file.url` روی Planet خوانده شود؛ Hub مسیر فایل ندارد.
+- CORS: مسیر `/api/files` درخواست `OPTIONS` و پاسخ‌های GET/خطا را با همان `HUB_ALLOWED_ORIGINS` هدر می‌دهد (`Access-Control-Allow-Origin`، `Authorization`، `Content-Disposition`). با `*` همهٔ دامنه‌ها مجازند؛ با لیست فقط Originهای دقیق. از cookie استفاده نمی‌شود.
+- این endpoint با Project Token است؛ ویجت عمومی مشتری نباید توکن پروژه داشته باشد و فایل‌های چت داخلی را از `file.url` Planet می‌خواند.
 - دسترسی در سطح **پروژه** است، نه گفتگو؛ چون Hub تاریخچه ندارد و نمی‌تواند مالکیت چت را بررسی کند. جداسازی گفتگویی وظیفهٔ Planet است.
 
 ### ۱۲.۳. قرارداد داخلی Hub ↔ آداپتور
@@ -851,6 +853,7 @@ Authorization: Bearer HUB_BALE_SERVICE_TOKEN
 - `BALE_SERVICE_URL` فقط آدرس داخلی است؛ endpoint آداپتور نباید عمومی شود.
 - احراز هویت آداپتور با `HUB_BALE_SERVICE_TOKEN` و مقایسهٔ constant-time انجام می‌شود.
 - UI باید فایل را با `fetch` و هدر `Authorization` بگیرد و به‌صورت blob URL نمایش دهد (یا Planet واسط باشد)؛ `<img src>` مستقیم بدون هدر کار نمی‌کند.
+- CORS فایل از همان `HUB_ALLOWED_ORIGINS` پیروی می‌کند؛ preflight بدون احراز هویت پاسخ می‌گیرد و فقط Originهای مجاز هدر CORS دریافت می‌کنند.
 - فایل‌ها محتوای مشتری‌اند: مجوز دیسک محدود، لاگ نکردن نام/URL، و پاک‌سازی دوره‌ای الزامی است.
 - محدودیت نرخ Hub برای `/api/files` اعمال می‌شود.
 - در صورت قطعی آداپتور، Hub خطای `502/503` می‌دهد و UI باید retry/نمایش خطا داشته باشد.

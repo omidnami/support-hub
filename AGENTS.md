@@ -2,7 +2,7 @@
 
 > حافظه پروژه برای مدل‌ها و ایجنت‌ها. پیش از هر تغییر این فایل را بخوانید و اگر تصمیم معماری، قرارداد یا محدودیت عملیاتی تغییر کرد، همین فایل را هم به‌روزرسانی کنید.
 
-**Last verified:** 2026-11-23 · base implementation commit `e13d931` · 201 tests passing (docs may be newer)
+**Last verified:** 2026-11-23 · base implementation commit `e13d931` · 204 tests passing (docs may be newer)
 
 ---
 
@@ -324,8 +324,8 @@ HUB_CACHE_TTL_NEGATIVE=60
 - `HUB_CACHE_STRICT=1` rejects token/webhook/source mutations with `503` when Redis is down, before touching MySQL.
 - Cache TTLs are seconds; defaults are 3h webhook/source, 15m token, 60s negative.
 - `HUB_WEBHOOK_ALLOW_HTTP` and `HUB_WEBHOOK_ALLOW_PRIVATE` are development-only. Both must be `0` in production.
-- `HUB_ALLOWED_ORIGINS` controls Socket.IO Origin acceptance (`*` = any, empty = same-origin, comma list = exact). Origin is **not** authentication: operator project tokens and client `robot_id + user_id` signatures are the boundaries, and non-browser clients can spoof or omit Origin.
-- `HUB_TRUST_PROXY` and `HUB_ALLOWED_ORIGINS` are independent: the former only affects rate-limit IPs, the latter only Socket.IO Origin checks.
+- `HUB_ALLOWED_ORIGINS` controls Socket.IO Origin acceptance **and `/api/files` CORS** (`*` = any, empty = same-origin, comma list = exact). Origin is **not** authentication: operator project tokens and client `robot_id + user_id` signatures are the boundaries, and non-browser clients can spoof or omit Origin.
+- `HUB_TRUST_PROXY` and `HUB_ALLOWED_ORIGINS` are independent: the former only affects rate-limit IPs, the latter Socket.IO Origin checks and `/api/files` CORS.
 - `HUB_WEBHOOK_TIMEOUT` is seconds (default 5, capped at 30).
 - `BALE_SERVICE_URL` is an internal adapter URL used only for `GET /api/files`; never expose it publicly.
 - `HUB_FILE_TIMEOUT` is the per-read timeout for proxied files (default 30s).
@@ -533,6 +533,7 @@ Documented in `docs/architecture.md` §10 and implemented in `cache.py` + module
 - **Keep the file cache TTL ≤ the provider link TTL.** Bale links expire in ~1h; cache bytes for 1h max and re-run `getFile` on a miss.
 - **The adapter file endpoint is private.** `/internal/files` uses `HUB_BALE_SERVICE_TOKEN` and must not be exposed by the reverse proxy; only Hub calls it.
 - **File access is project-scoped, not conversation-scoped.** Hub has no history to prove chat ownership; Planet must enforce per-conversation access if needed.
+- **`/api/files` needs CORS for browser callers.** It follows `HUB_ALLOWED_ORIGINS` (same knob as Socket.IO), supports unauthenticated `OPTIONS` preflight, allows the `Authorization` header, and does not use cookies. Customer widgets must use Planet `file.url`, not the project token.
 - **Do not cache 20MB blobs in Redis.** Use the adapter's disk cache; Redis is for small metadata/URLs only.
 
 ---
@@ -556,7 +557,7 @@ Before finishing any change:
 
 ## 15. Handoff snapshot (2026-11-22)
 
-- Phase one (internal chat + private Bale) plus the offline Planet webhook and the File Resolver are implemented and covered by **201 tests**.
+- Phase one (internal chat + private Bale) plus the offline Planet webhook and the File Resolver are implemented and covered by **204 tests**.
 - The optional Redis metadata cache is implemented (`cache.py`, `requirements.txt`, `HUB_REDIS_URL`); it caches only metadata and invalidates with project/source epochs.
 - Token rotation disconnects all project sockets; source token/robot changes and deletions disconnect matching clients. Session epochs are checked on every `chat` event.
 - A manual E2E with real Hub + MariaDB + `bale_service` + fake Bale API passed: webhook registration, inbound relay, dedup, outbound reply.
