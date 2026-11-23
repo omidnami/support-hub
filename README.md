@@ -4,6 +4,8 @@
 
 سرویس مستقل `bale_service` پیام‌های ربات بله را از webhook دریافت می‌کند، به Hub می‌فرستد و پاسخ اپراتور را با Socket.IO از Hub می‌گیرد و به بله می‌رساند. معماری کامل در [`docs/architecture.md`](docs/architecture.md) آمده است.
 
+برای یکپارچه‌سازی فروشگاه/پلنت، بخش [مرجع اتصال فروشگاه](#store-integration) خلاصهٔ همهٔ APIها، رویدادها، فایل و تنظیمات اتصال را یک‌جا دارد.
+
 ## فهرست مستندات
 
 - [معماری کامل](docs/architecture.md)
@@ -14,6 +16,7 @@
 - [اتصال سوکت](#socket)
 - [سرویس بله](#bale-service)
 - [پیام‌های فروشگاه آفلاین](#offline-webhook)
+- [مرجع اتصال فروشگاه](#store-integration)
 - [کدهای وضعیت](#status-codes)
 - [محدوده نسخه فعلی](#scope)
 
@@ -971,3 +974,179 @@ HUB_CACHE_STRICT=0
 - تست‌های واحد برای اعتبارسنجی، امضای کلاینت، محدودیت پیام، نرخ‌محدودی، bridge بله، webhook سرویس بله، webhook آفلاین پروژه و کش Redis در `tests/` قرار دارند. تست integration با MariaDB و بله واقعی در مخزن نیست.
 
 این مستند مربوط به پیاده‌سازی کنونی مخزن است، نه تأیید تست عملیاتی یا استقرار روی سرور.
+
+---
+
+<a id="store-integration"></a>
+## ۹. مرجع اتصال فروشگاه (Integration Guide)
+
+این بخش خلاصهٔ یکپارچهٔ همهٔ چیزهایی است که یک فروشگاه/پلنت برای اتصال به Hub لازم دارد. جزئیات هر مورد در بخش‌های قبلی آمده است.
+
+### ۹.۱. نقشهٔ کلی اتصال
+
+```text
+پنل/بک‌اند فروشگاه ── REST (Project Token) ──────────────► Hub
+پنل اپراتور        ── Socket.IO (Project Token) ─────────► Hub
+ویجت چت فروشگاه    ── Socket.IO (امضای robot_id/user_id) ─► Hub
+مشتری بله          ──► bale_service ── bridge ────────────► Hub
+Hub ── webhook امضاشده (فقط وقتی اپراتور آفلاین است) ────► Planet
+UI/Planet ── GET /api/files (Project Token) ──────────────► Hub
+Hub ── GET /internal/files (Service Token) ───────────────► آداپتور provider
+```
+
+- Hub فقط transport است و پیام/فایل/تاریخچه را دائمی ذخیره نمی‌کند.
+- `bale_service` تنها جایی است که توکن بات بله را دارد.
+- هر provider جدید (روبیکا و…) فقط باید قرارداد داخلی فایل را پیاده کند؛ سمت فروشگاه و Hub ثابت می‌ماند.
+
+### ۹.۲. احراز هویت
+
+| نقش | راه اتصال | Auth |
+|---|---|---|
+| API فروشگاه/پلنت | REST | `Authorization: Bearer PROJECT_TOKEN` |
+| اپراتور | Socket.IO | `auth: {token: PROJECT_TOKEN}` |
+| ویجت چت (کلاینت) | Socket.IO | `auth: {role: "client", robot_id, user_id, expires, signature}` |
+| bridge بله | Socket.IO | `auth: {role: "bridge", provider: "bale", token: HUB_BALE_SERVICE_TOKEN}` |
+
+- توکن پروژه را فقط در بک‌اند/پنل مدیریت نگه دار؛ آن را در صفحهٔ عمومی فروشگاه قرار نده.
+- برای ویجت چت، بک‌اند فروشگاه یک‌بار `client_key` را از `GET /api/projects/{id}/client-key` می‌گیرد و امضا می‌سازد:
+  ```text
+  signature = hex(HMAC-SHA256(client_key, f"{robot_id}\n{user_id}\n{expires}"))
+  ```
+- `expires` ثانیهٔ Unix و کوتاه‌عمر است (حداکثر ۳۶۰۰ ثانیه).
+- بعد از اتصال موفق، سرور رویداد `authenticated` را می‌فرستد.
+
+### ۹.۳. جریان پیام
+
+1. اپراتور یا کلاینت رویداد `chat` را با **هفت فیلد** می‌فرستد:
+   ```json
+   {
+     "user_id": "501",
+     "sender": "client",
+     "text": "سلام",
+     "file": null,
+     "robot_id": "987654",
+     "timestamp": 1794841200000,
+     "source": "bale"
+   }
+   ```
+2. Hub اعتبارسنجی می‌کند که `sender` با نقش اتصال و `source` با منبع مجاز بخواند.
+3. مسیر:
+   - `source=chat` → اتاق پروژه + اتاق همان گفتگو
+   - `source=bale` (اپراتور) → اتاق پروژه + اتاق `bridge:bale`
+   - bridge بله (پیام مشتری) → اتاق پروژه یا webhook آفلاین
+4. ACK سوکت:
+   ```json
+   {"status": true}
+   ```
+   یا در خطا:
+   ```json
+   {"status": false, "message": "...", "code": "..."}
+   ```
+   و همان خطا به‌صورت رویداد `chat_error` هم ارسال می‌شود.
+5. bridge بله می‌تواند آرگومان دوم metadata بفرستد:
+   ```json
+   {"update_id": 12345, "chat_id": "501", "delivery_id": "optional"}
+   ```
+   این‌ها به هفت فیلد اضافه نمی‌شوند.
+6. اگر هیچ اپراتوری در اتاق پروژه نباشد، Hub پیام را به webhook امضاشدهٔ Planet می‌فرستد و فقط با پاسخ `2xx` ACK موفق می‌دهد. بدون webhook یا با خطا، پاسخ `503` و `store_offline`/`webhook_failed` است.
+
+`chat_id` و `conversation_key` metadata انتقال‌اند، نه فیلد هشتم. `conversation_key = (project_id, source, robot_id, chat_id)`.
+
+### ۹.۴. فایل و رسانه
+
+فایل‌ها در پیام به‌صورت metadata می‌آیند و خود فایل با API جداگانه گرفته می‌شود:
+
+```http
+GET /api/files?source=bale&robot_id=987654&file_id=AgAC...
+Authorization: Bearer PROJECT_TOKEN
+```
+
+- `source` و `robot_id` باید متعلق به همان پروژه باشند؛ در غیر این صورت `403/404`.
+- پاسخ stream فایل است؛ خطاها: `400/404/410/413/502/503`.
+- محدودیت‌ها: بله حداکثر **۲۰MB** برای دانلود؛ کش موقت آداپتور **۱ ساعت**.
+- UI باید با `fetch` و هدر Authorization فایل را بگیرد و به‌صورت blob URL نمایش دهد؛ `<img src>` مستقیم بدون هدر کار نمی‌کند.
+- برای `source=chat` فایل روی Planet است و باید از `file.url` خوانده شود؛ Hub فایلی برای chat ذخیره یا proxy نمی‌کند.
+- دسترسی فایل در سطح **پروژه** است، نه گفتگو؛ Planet باید در صورت نیاز مجوز گفتگویی را اعمال کند.
+- مسیر داخلی `GET /internal/files` فقط با `HUB_BALE_SERVICE_TOKEN` و روی شبکهٔ خصوصی است؛ آن را در Reverse Proxy عمومی expose نکن.
+
+قالب ثابت `file`:
+
+```json
+{
+  "provider": "bale",
+  "type": "voice",
+  "file_id": "AgAC...",
+  "file_name": "voice.ogg",
+  "mime_type": "audio/ogg",
+  "file_size": 12345,
+  "duration": 12
+}
+```
+
+خروجی فایل:
+
+- پاسخ با همان `file_id` بهترین گزینه است.
+- `type` متد بله را انتخاب می‌کند: `photo`→`sendPhoto`، `voice`→`sendVoice`، `audio`→`sendAudio`، `video`→`sendVideo`، `animation`→`sendAnimation`، `document`→`sendDocument`.
+- فایل جدید فعلاً با `url` معتبر provider ارسال می‌شود (عکس تا ۵MB؛ سند URL فقط GIF/PDF/ZIP). آپلود multipart و تبدیل webm→OGG فاز بعد است.
+- ارسال بومی استیکر پشتیبانی نمی‌شود؛ استیکر فقط دریافت/نمایش می‌شود.
+
+### ۹.۵. مرجع REST API
+
+| متد و مسیر | Auth | کاربرد |
+|---|---|---|
+| `POST /api/register` | ندارد | عضویت اولیه و ساخت پروژه |
+| `PATCH /api/users/me` | Project Token | ویرایش کاربر |
+| `PATCH /api/projects/{id}` | Project Token | ویرایش پروژه |
+| `POST /api/projects/{id}/token` | Project Token | چرخش توکن پروژه (همهٔ سوکت‌های پروژه قطع می‌شوند) |
+| `POST /api/projects/{id}/webhook` | Project Token | ثبت/تعویض webhook آفلاین |
+| `DELETE /api/projects/{id}/webhook` | Project Token | حذف webhook |
+| `GET /api/projects/{id}/client-key` | Project Token | دریافت `client_key` برای امضای ویجت چت |
+| `POST /api/sources` | Project Token | ثبت منبع (`chat` یا `bale`) |
+| `PATCH /api/sources/{id}` | Project Token | تغییر توکن/ربات منبع |
+| `DELETE /api/sources/{id}` | Project Token | حذف منبع |
+| `GET /api/files?source=&robot_id=&file_id=` | Project Token | دریافت فایل/رسانه |
+| `GET /healthz` | ندارد | بررسی سلامت Hub |
+
+پاسخ‌های REST با `{"status": true|false, ...}` برمی‌گردند. کدهای خطا در بخش ۷ آمده است. نرخ‌محدودی HTTP برای هر IP اعمال می‌شود (بخش ۷).
+
+### ۹.۶. تنظیمات مرتبط با اتصال
+
+| متغیر | کاربرد |
+|---|---|
+| `HUB_ALLOWED_ORIGINS` | Originهای مجاز سوکت؛ `*` همه، خالی same-origin، یا فهرست کاماجدا. تغییر آن نیازمند restart است. |
+| `HUB_TRUST_PROXY` | فقط پشت پروکسی معتبر `1` شود تا rate limit از `X-Forwarded-For` بخواند. |
+| `HUB_BALE_SERVICE_TOKEN` | توکن bridge و همچنین احراز هویت داخلی فایل. |
+| `BALE_SERVICE_URL` | آدرس داخلی آداپتور بله برای `/api/files`؛ عمومی نشود. |
+| `HUB_FILE_TIMEOUT` | مهلت خواندن هر بخش فایل (ثانیه). |
+| `HUB_REDIS_URL` | اختیاری؛ کش metadata و پنجرهٔ failed update. بدون آن همه‌چیز از MySQL/حافظه کار می‌کند. |
+
+Reverse Proxy باید:
+
+- هدرهای `Upgrade` و `Connection` را برای WebSocket عبور دهد.
+- `Host` و `X-Forwarded-Proto` اصلی را حفظ کند (خصوصاً وقتی `HUB_ALLOWED_ORIGINS` خالی/same-origin است).
+- فقط `/webhooks/bale/<secret>` را به `bale_service` برساند؛ `/internal/files` را عمومی نکند.
+- مسیر webhook را در access log ماسک کند.
+
+### ۹.۷. تغییرات این نسخه (برای Git/Release Notes)
+
+- **File Resolver اضافه شد:** `GET /api/files` در Hub و `GET /internal/files` در آداپتور بله.
+- **قرارداد هفت‌فیلدی پیام تغییر نکرد.** فایل همچنان داخل فیلد `file` است؛ فقط URL موقت provider در پیام قرار نمی‌گیرد.
+- **قالب ثابت `file`** برای همهٔ providerها: `provider`, `type`, `file_id`, `file_name`, `mime_type`, `file_size`, `duration`, ...
+- **کش موقت فایل** در آداپتور با TTL و سقف حجم؛ Hub فایل را دائمی ذخیره نمی‌کند. هیچ migration دیتابیسی لازم نیست.
+- **خروجی بله** بر اساس `type` به `sendPhoto/sendVoice/sendAudio/sendVideo/sendAnimation/sendDocument` نگاشت می‌شود؛ استیکر خروجی بومی ندارد.
+- **Origin سوکت قابل تنظیم شد:** `HUB_ALLOWED_ORIGINS` (در `.env.example` مقدار `*` دارد). قبلاً فقط same-origin بود.
+- **دریافت پیام ناموفق بله گم نمی‌شود:** IDهای ناموفق در Redis/حافظه نگه داشته می‌شوند و موفقیت پیام بعدی باعث حذف آن‌ها نمی‌شود.
+- **کش Redis اختیاری** برای metadata و epochهای session؛ بدون Redis هیچ قابلیت پیامی از دست نمی‌رود.
+- تست‌ها: `python -m unittest discover -s tests` (۲۰۱ تست در این نسخه).
+
+### ۹.۸. چک‌لیست اتصال یک فروشگاه جدید
+
+1. `POST /api/register` و ذخیرهٔ `PROJECT_TOKEN` در بک‌اند.
+2. ثبت webhook آفلاین با `POST /api/projects/{id}/webhook` (در صورت نیاز).
+3. ثبت منبع `chat` و/یا `bale` با `POST /api/sources`.
+4. ساخت endpoint امضای کلاینت در بک‌اند با `client_key`.
+5. اتصال اپراتور به Socket.IO با توکن پروژه و گوش‌دادن به `chat`/`chat_error`.
+6. اتصال ویجت چت با امضای `robot_id + user_id` و ارسال/دریافت `chat`.
+7. پیاده‌سازی دریافت فایل با `GET /api/files` و نمایش blob.
+8. تست webhook آفلاین با هدرهای `X-Hub-Signature-256` و `X-Hub-Delivery` و idempotency سمت Planet.
+9. تنظیم Origin و Reverse Proxy طبق بخش ۹.۶.
